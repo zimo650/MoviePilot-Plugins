@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -111,9 +111,11 @@ class SubtitleShield(_PluginBase):
     _emby_url = ""
     _emby_apikey = ""
     _emby_refresh_mode = "item"
+    _emby_path_map = ""
+    _emby_touch = True
     _timeout = 10
     _max_depth = 4
-    _max_files = 20000
+    _max_files = 200000
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -136,9 +138,11 @@ class SubtitleShield(_PluginBase):
         self._emby_url = _norm_url(str(config.get("emby_url") or ""))
         self._emby_apikey = str(config.get("emby_apikey") or "")
         self._emby_refresh_mode = str(config.get("emby_refresh_mode") or "item")
+        self._emby_path_map = str(config.get("emby_path_map") or "")
+        self._emby_touch = bool(config.get("emby_touch", True))
         self._timeout = max(3, min(_safe_int(config.get("timeout"), 10), 120))
         self._max_depth = max(1, min(_safe_int(config.get("max_depth"), 4), 12))
-        self._max_files = max(100, min(_safe_int(config.get("max_files"), 20000), 500000))
+        self._max_files = max(100, min(_safe_int(config.get("max_files"), 200000), 1000000))
 
         if self._onlyonce:
             logger.info(f"{self.plugin_name}：立即执行一次规范化")
@@ -271,6 +275,19 @@ class SubtitleShield(_PluginBase):
                                 "hint": "item = 只刷新改动条目；library = 库扫描；both = 两者"}}),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(8, {"component": "VTextarea", "props": {
+                                "modelValue": self._emby_path_map, "rows": 2, "label": "路径映射（MoviePilot 路径:Emby 路径）",
+                                "placeholder": "/video/downloads/link/movie:/data/movie\n/video/downloads/link/tv:/data/tv",
+                                "hint": "容器路径和 Emby 的不一致时必须填，否则 Emby 收不到改动通知"}}),
+                            self.__col(4, {"component": "VSwitch", "props": {
+                                "modelValue": self._emby_touch, "label": "更新视频时间戳",
+                                "density": "compact",
+                                "hint": "改字幕名后 Emby 不会自动重新扫描，需要动一下视频文件时间"}}),
+                        ],
+                    },
                 ],
             },
             {
@@ -278,7 +295,7 @@ class SubtitleShield(_PluginBase):
                 "content": [
                     self.__col(12, {"component": "VAlert", "props": {
                         "type": "warning", "variant": "tonal",
-                        "text": "改名只影响字幕文件名，不会动视频。插件不删除原字幕，除非显式打开「清理同语言重复」。"}}),
+                        "text": "改名只影响字幕文件名，不会动视频内容；同语言重复字幕只提示、不删除。"}}),
                 ],
             },
         ], {
@@ -289,7 +306,9 @@ class SubtitleShield(_PluginBase):
             "prefer_format": self._prefer_format, "content_detect": self._content_detect,
             "min_chars": self._min_chars,
             "emby_enabled": self._emby_enabled, "emby_url": self._emby_url, "emby_apikey": self._emby_apikey,
-            "emby_refresh_mode": self._emby_refresh_mode, "timeout": self._timeout,
+            "emby_refresh_mode": self._emby_refresh_mode,
+            "emby_path_map": self._emby_path_map, "emby_touch": self._emby_touch,
+            "timeout": self._timeout,
             "max_depth": self._max_depth,
         }
 
@@ -443,6 +462,8 @@ class SubtitleShield(_PluginBase):
                 done.append({**item, "ok": True})
                 touched_dirs.add(item["dir"])
                 count += 1
+                if self._emby_touch:
+                    self.__touch_video(item)
                 logger.info(f"{self.plugin_name}：{item['subtitle']} -> {item['target']}")
             except Exception as e:
                 failed.append({**item, "reason": str(e)})
@@ -514,6 +535,47 @@ class SubtitleShield(_PluginBase):
 
     # ------------------------------------------------------------- Emby
 
+    def __map_emby_path(self, path: str) -> str:
+        """把 MoviePilot 侧路径翻译成 Emby 侧路径（容器挂载点通常不同）。"""
+        if not self._emby_path_map:
+            return path
+        candidates: List[Tuple[str, str]] = []
+        for chunk in re.split(r"[,;\n]+", self._emby_path_map):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=>" in chunk:
+                src, dst = chunk.split("=>", 1)
+                candidates.append((src, dst))
+                continue
+            # 兼容 src:dst 与 src=dst；逐字符尝试切分，最后按前缀匹配度取最优，
+            # 这样 Windows 盘符里的冒号（C:\）不会被误当成分隔符。
+            for idx, ch in enumerate(chunk):
+                if ch in ":=":
+                    candidates.append((chunk[:idx], chunk[idx + 1:]))
+        best_src = ""
+        best_dst = ""
+        for raw_src, raw_dst in candidates:
+            src = raw_src.strip().replace("\\", "/").rstrip("/")
+            dst = raw_dst.strip().replace("\\", "/").rstrip("/")
+            probe = path.replace("\\", "/")
+            if not src or not dst or not probe.startswith(src):
+                continue
+            if len(src) > len(best_src):
+                best_src, best_dst = src, dst
+        if not best_src:
+            return path
+        return best_dst + path.replace("\\", "/")[len(best_src):]
+
+    def __touch_video(self, item: Dict[str, Any]) -> None:
+        """动一下视频文件的时间戳，逼迫 Emby 重新探测外挂字幕。"""
+        video_path = os.path.join(item["dir"], item["video"])
+        try:
+            if os.path.isfile(video_path):
+                os.utime(video_path, None)
+        except Exception as e:
+            logger.debug(f"{self.plugin_name}：更新时间戳失败 {video_path} {e}")
+
     def __refresh_emby(self, dirs: List[str]) -> Optional[Dict[str, Any]]:
         if not (self._emby_enabled and self._emby_url):
             return None
@@ -524,7 +586,7 @@ class SubtitleShield(_PluginBase):
             headers["X-Emby-Token"] = self._emby_apikey
             headers["Authorization"] = f'MediaBrowser Token="{self._emby_apikey}"'
         if mode in ("item", "both") and dirs:
-            updates = [{"Path": d, "UpdateType": "Modified"} for d in dirs]
+            updates = [{"Path": self.__map_emby_path(d), "UpdateType": "Modified"} for d in dirs]
             res = _http_json("POST", f"{self._emby_url}/Library/Media/Updated", headers=headers,
                              payload={"Updates": updates}, timeout=self._timeout)
             if res.get("ok"):
