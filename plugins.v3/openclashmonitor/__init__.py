@@ -32,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from importlib import import_module
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.sdk.logging import logger
@@ -53,15 +54,24 @@ except Exception:  # noqa: BLE001
     except Exception:  # noqa: BLE001
         NotificationType = None  # type: ignore
 
+try:  # 定向通知渠道（新版宿主用 MessageChannel 别名）
+    from app.schemas.types import NotificationChannel  # type: ignore
+except Exception:  # noqa: BLE001
+    try:
+        from app.schemas.types import MessageChannel as NotificationChannel  # type: ignore
+    except Exception:  # noqa: BLE001
+        NotificationChannel = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
-_UA = "MoviePilot-OpenClashMonitor/0.3.0"
+_UA = "MoviePilot-OpenClashMonitor/0.4.0"
 _SNAPSHOT_KEY = "snapshot"
 _NOTIFY_KEY = "notified_versions"
 _ALERT_KEY = "alert_state"
+_REPORT_KEY = "report_state"
 _DASHBOARD_KEY = "openclashmonitor"
 _TREND_MAX_POINTS = 336
 _ALERT_STATE_KEEP_SECONDS = 7 * 24 * 3600
@@ -109,6 +119,19 @@ _DNS_MODE_OPTIONS = [
     {"title": "关闭（只用内置 UDP 探测）", "value": "none"},
 ]
 
+# 报告可定向的 MoviePilot 通知渠道（值 → 渠道枚举名）
+_REPORT_CHANNEL_OPTIONS = [
+    {"title": "Telegram", "value": "telegram"},
+    {"title": "QQ", "value": "qq"},
+    {"title": "企业微信", "value": "wechat"},
+]
+
+_REPORT_CHANNEL_ENUM = {
+    "telegram": "Telegram",
+    "qq": "QQ",
+    "wechat": "Wechat",
+}
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "dashboard": True,
@@ -140,6 +163,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "alert_upstream_errors": 3,
     "alert_days": 7,
     "alert_cooldown": 180,
+    "zh_url": "",
+    "zh_height": 760,
+    "report_enabled": False,
+    "report_cron": "0 9 * * *",
+    "report_channels": [],
+    "report_max_nodes": 5,
 }
 
 
@@ -605,7 +634,7 @@ class OpenClashMonitor(_PluginBase):
         "插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.3.0"
+    plugin_version = "0.4.0"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "openclashmonitor_"
@@ -642,6 +671,12 @@ class OpenClashMonitor(_PluginBase):
     _alert_upstream_errors: int = 3
     _alert_days: int = 7
     _alert_cooldown: int = 180
+    _zh_url: str = ""
+    _zh_height: int = 760
+    _report_enabled: bool = False
+    _report_cron: str = "0 9 * * *"
+    _report_channels: List[str] = []
+    _report_max_nodes: int = 5
     _timeout: float = 8.0
 
     _refreshing: bool = False
@@ -690,6 +725,12 @@ class OpenClashMonitor(_PluginBase):
         self._alert_upstream_errors = max(1, min(_safe_int(merged.get("alert_upstream_errors"), 3), 100))
         self._alert_days = max(0, min(_safe_int(merged.get("alert_days"), 7), 60))
         self._alert_cooldown = max(0, min(_safe_int(merged.get("alert_cooldown"), 180), 10080))
+        self._zh_url = _normalize_url(str(merged.get("zh_url") or ""))
+        self._zh_height = max(320, min(_safe_int(merged.get("zh_height"), 760), 3000))
+        self._report_enabled = bool(merged.get("report_enabled"))
+        self._report_cron = str(merged.get("report_cron") or "").strip() or "0 9 * * *"
+        self._report_channels = self.__normalize_channels(merged.get("report_channels"))
+        self._report_max_nodes = max(1, min(_safe_int(merged.get("report_max_nodes"), 5), 30))
 
         if not self._enabled:
             return
@@ -721,10 +762,10 @@ class OpenClashMonitor(_PluginBase):
             pass
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册周期采集服务。"""
+        """注册周期采集服务与定时报告服务。"""
         if not self._enabled:
             return []
-        return [
+        services: List[Dict[str, Any]] = [
             {
                 "id": f"{self.__class__.__name__}.Refresh",
                 "name": "OpenClash 监控定时采集",
@@ -733,6 +774,60 @@ class OpenClashMonitor(_PluginBase):
                 "kwargs": {"minutes": self._interval},
             }
         ]
+        trigger = self.__report_trigger()
+        if trigger is not None:
+            services.append(
+                {
+                    "id": f"{self.__class__.__name__}.Report",
+                    "name": "OpenClash 监控定时报告",
+                    "trigger": trigger,
+                    "func": self.send_report,
+                    "kwargs": {},
+                }
+            )
+        return services
+
+    def __report_trigger(self) -> Any:
+        """把配置里的 cron 表达式转成宿主认识的触发器，非法时返回 None。"""
+        if not self._report_enabled:
+            return None
+        expression = str(self._report_cron or "").strip()
+        if not expression:
+            return None
+        cron_cls = None
+        for module_name in ("app.sdk.scheduler", "apscheduler.triggers.cron"):
+            try:
+                module = import_module(module_name)
+            except Exception:  # noqa: BLE001
+                continue
+            cron_cls = getattr(module, "CronTrigger", None)
+            if cron_cls is not None:
+                break
+        if cron_cls is None or not hasattr(cron_cls, "from_crontab"):
+            logger.warning("OpenClash 监控：宿主缺少 CronTrigger，定时报告未启用")
+            return None
+        try:
+            return cron_cls.from_crontab(expression)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"OpenClash 监控：cron 表达式「{expression}」无效 {err}")
+            return None
+
+    @staticmethod
+    def __normalize_channels(raw: Any) -> List[str]:
+        """把配置里的渠道值归一成 _REPORT_CHANNEL_OPTIONS 中的取值。"""
+        if isinstance(raw, str):
+            items = re.split(r"[,;\s]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            items = list(raw)
+        else:
+            items = []
+        result: List[str] = []
+        valid = {item["value"] for item in _REPORT_CHANNEL_OPTIONS}
+        for item in items:
+            value = str(item or "").strip().lower()
+            if value in valid and value not in result:
+                result.append(value)
+        return result
 
     # ------------------------------------------------------------------
     # 远程命令
@@ -800,6 +895,20 @@ class OpenClashMonitor(_PluginBase):
                 "category": "插件命令",
                 "data": {"action": "openclashmonitor_node"},
             },
+            {
+                "cmd": "/openclash_report",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 监控：立即推送一次状态报告到已配置的通知渠道",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_report"},
+            },
+            {
+                "cmd": "/openclash_report_channels",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 监控：按参数临时指定渠道推送，用法 /openclash_report_channels telegram,qq,wechat",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_report_channels"},
+            },
         ]
 
     def run_command(self, event: Any) -> None:
@@ -822,6 +931,14 @@ class OpenClashMonitor(_PluginBase):
 
         if name == "trend":
             self.post_message(title="OpenClash 趋势", text=self.__trend_text())
+            return
+
+        if name in ("report", "report_channels"):
+            arg_str = str(data.get("arg_str") or data.get("text") or "").strip()
+            channels = self.__normalize_channels(arg_str) if (name == "report_channels" and arg_str) else None
+            result = self.api_report({"channels": channels} if channels else {})
+            if not result.get("ok"):
+                self.post_message(title="OpenClash 报告失败", text=str(result.get("message") or "未知错误"))
             return
 
         arg_str = str(data.get("arg_str") or data.get("text") or "").strip()
@@ -925,6 +1042,20 @@ class OpenClashMonitor(_PluginBase):
                 "auth": "apikey",
                 "summary": "一键操作：start/stop/restart/rule/flush/flush_smart/close/switch_config/node",
             },
+            {
+                "path": "/action_web",
+                "endpoint": self.api_action_web,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "页面按钮专用的一键操作（切规则模式、切节点、清缓存）",
+            },
+            {
+                "path": "/report",
+                "endpoint": self.api_report,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即推送一次状态报告到已选通知渠道",
+            },
         ]
 
     def api_snapshot(self) -> Dict[str, Any]:
@@ -1014,6 +1145,34 @@ class OpenClashMonitor(_PluginBase):
             except Exception as err:  # noqa: BLE001
                 logger.warning(f"OpenClash 监控：操作后刷新失败 {err}")
         return result
+
+    def api_action_web(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """页面按钮调用的一键操作。
+
+        页面里点击按钮只会触发切规则模式、切节点、清缓存这类可逆动作，
+        因此对这几个动作自动补上 ``confirm``；其余动作仍然需要显式确认。
+        """
+        data = payload if isinstance(payload, dict) else {}
+        action = str(data.get("action") or "").strip().lower()
+        safe = {"rule", "node", "flush", "flush_smart"}
+        if action in safe and not data.get("confirm"):
+            data = dict(data)
+            data["confirm"] = True
+        return self.api_action(data)
+
+    def api_report(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """立即推送一次报告。"""
+        data = payload if isinstance(payload, dict) else {}
+        channels = self.__normalize_channels(data.get("channels")) if data.get("channels") else None
+        if channels:
+            snapshot = self.__cached() or self.refresh() or {}
+            if not snapshot:
+                return {"timestamp": _now_text(), "ok": False, "message": "暂无采集数据"}
+            text = self.__report_text(snapshot)
+            sent = self.__post_to_channels("OpenClash 监控报告", text, channels)
+            return {"timestamp": _now_text(), "ok": True, "channels": sent,
+                    "message": f"报告已发送（{len(text)} 字符）"}
+        return self.send_report(force=True)
 
     # ------------------------------------------------------------------
     # 配置表单
@@ -1180,6 +1339,50 @@ class OpenClashMonitor(_PluginBase):
                                                 "props": {"model": "alert_cooldown",
                                                           "label": "告警冷却(分钟)",
                                                           "placeholder": "180"}}),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__form_col(8, {"component": "VTextField",
+                                                "props": {"model": "zh_url",
+                                                          "label": "zashboard 面板地址",
+                                                          "placeholder": "http://192.168.1.1:7116/",
+                                                          "hint": "留空则不显示内嵌面板；面板里可直接切换代理组",
+                                                          "persistentHint": True}}),
+                            self.__form_col(4, {"component": "VTextField",
+                                                "props": {"model": "zh_height",
+                                                          "label": "面板高度(px)",
+                                                          "placeholder": "760"}}),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__form_col(3, {"component": "VSwitch",
+                                                "props": {"model": "report_enabled",
+                                                          "label": "启用定时报告",
+                                                          "hint": "按 cron 推送到所选渠道",
+                                                          "persistentHint": True}}),
+                            self.__form_col(4, {"component": "VTextField",
+                                                "props": {"model": "report_cron",
+                                                          "label": "定时表达式",
+                                                          "placeholder": "0 9 * * *",
+                                                          "hint": "cron 五段式：分 时 日 月 周",
+                                                          "persistentHint": True}}),
+                            self.__form_col(3, {"component": "VSelect",
+                                                "props": {"model": "report_channels",
+                                                          "label": "通知渠道",
+                                                          "items": _REPORT_CHANNEL_OPTIONS,
+                                                          "multiple": True,
+                                                          "chips": True,
+                                                          "clearable": True,
+                                                          "hint": "留空则跟随 MoviePilot 默认路由",
+                                                          "persistentHint": True}}),
+                            self.__form_col(2, {"component": "VTextField",
+                                                "props": {"model": "report_max_nodes",
+                                                          "label": "报告节点数",
+                                                          "placeholder": "5"}}),
                         ],
                     },
                 ],
@@ -2370,6 +2573,204 @@ class OpenClashMonitor(_PluginBase):
         self.save_data(_ALERT_KEY, state)
 
     # ------------------------------------------------------------------
+    # 报告推送
+    # ------------------------------------------------------------------
+
+    def __channel_enum(self, value: str) -> Any:
+        """把配置里的渠道值转成宿主的 NotificationChannel 枚举。"""
+        if NotificationChannel is None:
+            return None
+        enum_name = _REPORT_CHANNEL_ENUM.get(str(value or "").strip().lower())
+        if not enum_name:
+            return None
+        return getattr(NotificationChannel, enum_name, None)
+
+    def __post_to_channels(self, title: str, text: str,
+                           channels: Optional[List[str]] = None) -> List[str]:
+        """按选定渠道推送；未选渠道时交给 MoviePilot 的默认路由。"""
+        selected = list(channels if channels is not None else self._report_channels)
+        mtype = getattr(NotificationType, "Plugin", None) if NotificationType else None
+        sent: List[str] = []
+        if not selected:
+            self.post_message(mtype=mtype, title=title, text=text)
+            return ["default"]
+        for value in selected:
+            channel = self.__channel_enum(value)
+            if channel is None:
+                logger.warning(f"OpenClash 监控：宿主不支持通知渠道 {value}，已跳过")
+                continue
+            self.post_message(mtype=mtype, channel=channel, title=title, text=text)
+            sent.append(value)
+        if not sent:
+            # 配置的渠道一个都不被宿主支持时退回默认路由，避免静默丢失
+            self.post_message(mtype=mtype, title=title, text=text)
+            return ["default"]
+        return sent
+
+    def send_report(self, force: bool = False) -> Dict[str, Any]:
+        """生成并推送一次状态报告。
+
+        :param force: 为 True 时忽略报告开关（手动触发用）
+        """
+        if not self._enabled:
+            return {"timestamp": _now_text(), "ok": False, "message": "插件未启用"}
+        if not self._report_enabled and not force:
+            return {"timestamp": _now_text(), "ok": False, "message": "定时报告未开启"}
+        snapshot = self.__cached() or {}
+        try:
+            fresh = self.refresh()
+            if fresh:
+                snapshot = fresh
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"OpenClash 监控：报告前采集失败，改用上次数据 {err}")
+        if not snapshot:
+            return {"timestamp": _now_text(), "ok": False, "message": "暂无采集数据"}
+        text = self.__report_text(snapshot)
+        channels = self.__post_to_channels("OpenClash 监控报告", text)
+        record = {
+            "timestamp": _now_text(),
+            "channels": channels,
+            "length": len(text),
+            "alerts": len([item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]),
+        }
+        try:
+            self.save_data(_REPORT_KEY, record)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"OpenClash 监控：保存报告记录失败 {err}")
+        return {"timestamp": record["timestamp"], "ok": True, "channels": channels,
+                "message": f"报告已发送（{len(text)} 字符）", "text": text}
+
+    def __report_text(self, snapshot: Dict[str, Any]) -> str:
+        """把快照拼成适合 IM 阅读的报告文本。"""
+        clash = snapshot.get("clash") if isinstance(snapshot.get("clash"), dict) else {}
+        nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), dict) else {}
+        subscription = snapshot.get("subscription") if isinstance(snapshot.get("subscription"), dict) else {}
+        versions = snapshot.get("versions") if isinstance(snapshot.get("versions"), dict) else {}
+        dns = snapshot.get("dns") if isinstance(snapshot.get("dns"), dict) else {}
+        alerts = [item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]
+
+        lines: List[str] = [f"OpenClash 监控报告 · {snapshot.get('timestamp') or _now_text()}", ""]
+        if clash.get("running") is not None:
+            running = bool(clash.get("running"))
+        elif clash.get("run_mode") or clash.get("api_url"):
+            running = True
+        elif clash.get("clash_enabled") is not None:
+            running = bool(clash.get("clash_enabled"))
+        else:
+            running = None
+        status = "运行中" if running else ("未运行" if running is False else "未知")
+        parts = [status]
+        for key in ("run_mode", "rule_mode", "core_type"):
+            value = str(clash.get(key) or "")
+            if value:
+                parts.append(value)
+        if clash.get("core_version"):
+            parts.append(str(clash["core_version"]))
+        lines.append("状态：" + " · ".join(parts))
+
+        counters: List[str] = []
+        if clash.get("connections") is not None:
+            counters.append(f"连接 {_safe_int(clash.get('connections'))}")
+        if clash.get("mem"):
+            counters.append(f"内存 {_format_size(clash.get('mem'))}")
+        if clash.get("cpu_percent") is not None:
+            counters.append(f"CPU {_safe_float(clash.get('cpu_percent')):g}%")
+        if clash.get("load_avg"):
+            counters.append(f"负载 {clash.get('load_avg')}")
+        if counters:
+            lines.append(" · ".join(counters))
+
+        total = _safe_int(nodes.get("total"))
+        alive = _safe_int(nodes.get("alive"))
+        if total:
+            ratio = round(alive * 100.0 / total, 1)
+            lines.append(f"节点：在线 {alive}/{total}（{ratio}%），平均延迟 {_safe_int(nodes.get('avg_delay'))} ms")
+            fastest = [item for item in (nodes.get("nodes") or [])
+                       if isinstance(item, dict) and item.get("state") == "ok"]
+            fastest.sort(key=lambda item: _safe_int(item.get("delay")) or 99999)
+            lines.extend(f"· {item.get('name')} {_safe_int(item.get('delay'))} ms"
+                         for item in fastest[: self._report_max_nodes])
+
+        items = [item for item in (subscription.get("items") or []) if isinstance(item, dict)]
+        if items:
+            lines.append("")
+            lines.append("订阅：")
+            for item in items:
+                pieces = [str(item.get("name") or "")]
+                used = str(item.get("used") or "")
+                total_text = str(item.get("total") or "")
+                surplus = str(item.get("surplus") or "")
+                percent = item.get("percent")
+                traffic = ""
+                if used and total_text:
+                    traffic = f"已用 {used} / {total_text}"
+                elif surplus:
+                    traffic = f"剩余 {surplus}"
+                if traffic and isinstance(percent, (int, float)):
+                    traffic += f"（{percent:g}%）"
+                elif traffic:
+                    traffic += "（已用比例未知）"
+                if traffic:
+                    pieces.append(traffic)
+                if item.get("days"):
+                    pieces.append(f"剩余 {item.get('days')}")
+                elif item.get("expire"):
+                    pieces.append(f"到期 {item.get('expire')}")
+                lines.append("· " + "，".join(piece for piece in pieces if piece))
+
+        version_lines: List[str] = []
+        for label, prefix in (("插件", "plugin"), ("内核", "core"), ("LocalDNS", "dns")):
+            current = str(versions.get(f"{prefix}_current") or "")
+            latest = str(versions.get(f"{prefix}_latest") or "")
+            if not current:
+                continue
+            if versions.get(f"{prefix}_update"):
+                version_lines.append(f"· {label} {current} → {latest} 可更新")
+            else:
+                version_lines.append(f"· {label} {current} 已是最新")
+        if version_lines:
+            lines.append("")
+            lines.append("版本：")
+            lines.extend(version_lines)
+
+        if dns and str(dns.get("provider") or "") not in ("", "none"):
+            lines.append("")
+            scope: List[str] = []
+            if dns.get("core_version"):
+                scope.append(str(dns["core_version"]))
+            if dns.get("ui_version"):
+                scope.append(str(dns["ui_version"]))
+            head = "LocalDNS" + (" " + " / ".join(scope) if scope else "")
+            if dns.get("queries") is not None:
+                head += f"，查询 {_safe_int(dns.get('queries'))}，拦截 {_safe_float(dns.get('blocked_percent')):g}%"
+            lines.append(head)
+            health = [item for item in (dns.get("upstream_health") or []) if isinstance(item, dict)]
+            bad = [item for item in health if not item.get("ok")]
+            if health:
+                lines.append(f"上游 {len(health)} 个，异常 {len(bad)} 个")
+                for item in bad[:3]:
+                    lines.append(f"· {item.get('server')}（{item.get('group')}）失败 {_safe_int(item.get('errors')) + _safe_int(item.get('timeouts'))} 次")
+            probes = [item for item in (snapshot.get("probe") or []) if isinstance(item, dict)]
+            if probes:
+                summary = "、".join(
+                    f"{item.get('server')} {'通' if item.get('ok') else '不通'} {_safe_float(item.get('latency_ms')):g}ms"
+                    if item.get("latency_ms") is not None else
+                    f"{item.get('server')} {'通' if item.get('ok') else '不通'}"
+                    for item in probes[:4]
+                )
+                lines.append(f"主动探测：{summary}")
+
+        if alerts:
+            lines.append("")
+            lines.append(f"告警 {len(alerts)} 条：")
+            lines.extend(f"· {item.get('title')}：{item.get('text')}" for item in alerts[:8])
+        elif self._alert_enabled:
+            lines.append("")
+            lines.append("暂无告警")
+
+        return "\n".join(lines)[:1800]
+
+    # ------------------------------------------------------------------
     # 一键操作
     # ------------------------------------------------------------------
 
@@ -2579,6 +2980,12 @@ class OpenClashMonitor(_PluginBase):
         alerts_card = self.__alerts_card(snapshot)
         if alerts_card:
             content.append(alerts_card)
+        switch_card = self.__group_switch_card(snapshot)
+        if switch_card:
+            content.append(switch_card)
+        zashboard_card = self.__zashboard_card()
+        if zashboard_card:
+            content.append(zashboard_card)
         trend_card = self.__trend_card(snapshot)
         if trend_card:
             content.append(trend_card)
@@ -2590,6 +2997,7 @@ class OpenClashMonitor(_PluginBase):
             self.__dns_card(snapshot),
             self.__probe_card(snapshot),
             self.__querylog_card(snapshot),
+            self.__report_card(),
         ):
             if card:
                 content.append(card)
@@ -2808,6 +3216,174 @@ class OpenClashMonitor(_PluginBase):
             + ("" if self._actions_enabled else "当前已在配置中关闭一键操作。")
         )
         return self.__table_card("一键操作", rows, cols=12, md=12, caption=caption)
+
+    def __zashboard_card(self) -> Optional[Dict[str, Any]]:
+        """内嵌 zashboard 面板，可直接在里面选代理组。"""
+        if not self._zh_url:
+            return None
+        height = max(320, min(_safe_int(self._zh_height, 760), 3000))
+        frame_html = (
+            f'<iframe src="{self._zh_url}" title="zashboard" '
+            f'style="width:100%;height:{height}px;border:0;border-radius:8px;'
+            f'background:#0b0f19;" referrerpolicy="no-referrer" loading="lazy"></iframe>'
+        )
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 12},
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "class": "mb-3"},
+                    "content": [
+                        {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                         "text": "zashboard 控制面板"},
+                        {"component": "VCardText", "content": [
+                            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-2"},
+                             "text": "面板内可直接切换代理组、查看连接与延迟；"
+                                     "若浏览器或反向代理禁止内嵌，请点「在新窗口打开」。"},
+                            {"component": "div", "props": {"class": "mb-2"}},
+                            {"component": "VBtn", "props": {
+                                "size": "small", "variant": "outlined", "color": "primary",
+                                "href": self._zh_url, "target": "_blank", "prependIcon": "mdi-open-in-new",
+                             }, "text": "在新窗口打开"},
+                            {"component": "div", "html": frame_html},
+                        ]},
+                    ],
+                }
+            ],
+        }
+
+    def __group_switch_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """在页面里直接点按钮切策略组节点与规则模式。"""
+        if not self._actions_enabled:
+            return None
+        nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), dict) else {}
+        groups = [item for item in (nodes.get("groups") or [])
+                  if isinstance(item, dict) and _safe_int(item.get("count")) > 0]
+        if not groups:
+            return None
+        delay_map = {str(item.get("name")): _safe_int(item.get("delay"))
+                     for item in (nodes.get("nodes") or []) if isinstance(item, dict)}
+        state_map = {str(item.get("name")): str(item.get("state") or "")
+                     for item in (nodes.get("nodes") or []) if isinstance(item, dict)}
+        groups.sort(key=lambda item: -_safe_int(item.get("count")))
+
+        api_path = "/api/v1/plugin/OpenClashMonitor/action_web"
+        blocks: List[Dict[str, Any]] = []
+
+        clash = snapshot.get("clash") if isinstance(snapshot.get("clash"), dict) else {}
+        current_mode = str(clash.get("rule_mode") or "").lower()
+        mode_buttons: List[Dict[str, Any]] = []
+        for mode, label in (("rule", "规则"), ("global", "全局"), ("direct", "直连")):
+            props: Dict[str, Any] = {"size": "small", "variant": "flat" if mode == current_mode else "tonal",
+                                     "class": "mr-2", "title": mode}
+            if mode == current_mode:
+                props["color"] = "primary"
+            mode_buttons.append({
+                "component": "VBtn",
+                "props": props,
+                "text": label,
+                "events": {"click": {"api": api_path, "method": "POST",
+                                     "params": {"action": "rule", "value": mode}}},
+            })
+        blocks.append({
+            "component": "div",
+            "props": {"class": "mb-3"},
+            "content": [
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"},
+                 "text": f"规则模式（当前 {current_mode or '未知'}）"},
+                {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": mode_buttons},
+            ],
+        })
+
+        for group in groups[:4]:
+            name = str(group.get("name") or "")
+            now = str(group.get("now") or "")
+            members = [item for item in (group.get("members") or []) if isinstance(item, str)]
+            members.sort(key=lambda member: (
+                state_map.get(member) not in ("ok", "idle"),
+                delay_map.get(member) or 10 ** 9,
+            ))
+            shown = members[:8]
+            if now and now in members and now not in shown:
+                shown = [now] + shown[:7]
+            buttons: List[Dict[str, Any]] = []
+            for member in shown:
+                label = member if len(member) <= 14 else member[:13] + "…"
+                delay = delay_map.get(member) or 0
+                text = f"{label} {delay}ms" if delay else label
+                props = {"size": "x-small", "variant": "flat" if member == now else "tonal",
+                         "class": "mr-1 mb-1", "title": member}
+                if member == now:
+                    props["color"] = "primary"
+                buttons.append({
+                    "component": "VBtn",
+                    "props": props,
+                    "text": text,
+                    "events": {"click": {"api": api_path, "method": "POST",
+                                         "params": {"action": "node", "group": name, "value": member}}},
+                })
+            blocks.append({
+                "component": "div",
+                "props": {"class": "mb-3"},
+                "content": [
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"},
+                     "text": f"{name}（当前 {now or '-'}，共 {_safe_int(group.get('count'))} 个节点）"},
+                    {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": buttons},
+                ],
+            })
+
+        content: List[Dict[str, Any]] = [
+            {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "快捷切换"},
+            {"component": "VCardText", "content": blocks},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"},
+             "text": "点击按钮会立即切换路由器上的 OpenClash 状态，页面随后自动刷新；"
+                     "只想查看不想改动的可以在配置里关闭「启用一键操作」。"},
+        ]
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 12},
+            "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "mb-3"},
+                         "content": [{"component": "VCardText", "content": content}]}],
+        }
+
+    def __report_card(self) -> Dict[str, Any]:
+        """定时报告的状态与手动发送按钮。"""
+        record = self.get_data(_REPORT_KEY)
+        record = record if isinstance(record, dict) else {}
+        labels = {item["value"]: item["title"] for item in _REPORT_CHANNEL_OPTIONS}
+        chosen = "、".join(labels.get(value, value) for value in self._report_channels)
+        body: List[Dict[str, Any]] = [
+            {"component": "thead",
+             "content": [{"component": "tr",
+                          "content": [{"component": "th", "text": text}
+                                      for text in ("项目", "值")]}]},
+            {"component": "tbody", "content": []},
+        ]
+        rows = [
+            ("定时报告", "已开启" if self._report_enabled else "未开启"),
+            ("定时表达式", self._report_cron if self._report_enabled else "-"),
+            ("通知渠道", chosen or "跟随 MoviePilot 默认路由"),
+            ("上次发送", str(record.get("timestamp") or "尚未发送")),
+        ]
+        for title, value in rows:
+            body[1]["content"].append(
+                {"component": "tr",
+                 "content": [{"component": "td", "props": {"class": "font-weight-medium"}, "text": title},
+                             {"component": "td", "text": value}]}
+            )
+        extra = [
+            {"component": "div", "props": {"class": "mt-3"},
+             "content": [{"component": "VBtn",
+                          "props": {"size": "small", "color": "primary", "variant": "flat",
+                                    "prependIcon": "mdi-send"},
+                          "text": "立即发送报告",
+                          "events": {"click": {"api": "/api/v1/plugin/OpenClashMonitor/report",
+                                               "method": "POST", "params": {}}}}]},
+        ]
+        caption = ("定时报告由 MoviePilot 的调度器按 cron 触发，内容含状态、节点、订阅、版本、"
+                   "LocalDNS 上游健康与当前告警；渠道留空时交给 MoviePilot 的默认通知路由。")
+        return self.__table_card("通知报告", body, cols=12, md=12, caption=caption, extra=extra)
 
     def __version_card(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """版本与更新对比卡片。"""
