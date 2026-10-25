@@ -58,10 +58,25 @@ except Exception:  # noqa: BLE001
 # 常量
 # ---------------------------------------------------------------------------
 
-_UA = "MoviePilot-OpenClashMonitor/0.1.0"
+_UA = "MoviePilot-OpenClashMonitor/0.3.0"
 _SNAPSHOT_KEY = "snapshot"
 _NOTIFY_KEY = "notified_versions"
+_ALERT_KEY = "alert_state"
 _DASHBOARD_KEY = "openclashmonitor"
+_TREND_MAX_POINTS = 336
+_ALERT_STATE_KEEP_SECONDS = 7 * 24 * 3600
+_ACTION_NAMES = {
+    "start": "启动 OpenClash",
+    "stop": "停止 OpenClash",
+    "restart": "重启 OpenClash",
+    "rule": "切换规则模式",
+    "node": "切换策略组节点",
+    "flush": "清理 DNS / Fake-IP 缓存",
+    "flush_smart": "清理 Smart 缓存",
+    "close": "关闭全部连接",
+    "switch_config": "切换配置文件",
+}
+_RULE_MODES = ("rule", "global", "direct")
 
 # Clash / Mihomo 里不属于真实节点的内置代理：优先按 type 判定，名字作为兜底
 _BUILTIN_PROXY_TYPES = {
@@ -118,6 +133,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "node_limit": 15,
     "querylog_limit": 20,
     "timeout": 8,
+    "actions_enabled": True,
+    "trend_days": 7,
+    "alert_enabled": True,
+    "alert_offline_percent": 60,
+    "alert_upstream_errors": 3,
+    "alert_days": 7,
+    "alert_cooldown": 180,
 }
 
 
@@ -207,6 +229,28 @@ def _clean_loading(value: Any) -> str:
     if text in ("0", "null", "None"):
         return ""
     return text
+
+
+def _days_left(item: Dict[str, Any]) -> Optional[int]:
+    """从订阅条目里推算剩余天数；无法判断时返回 None。"""
+    if not isinstance(item, dict):
+        return None
+    days_text = _clean_loading(item.get("days"))
+    if days_text:
+        if "过期" in days_text:
+            return 0
+        match = re.search(r"(\d+)", days_text)
+        if match:
+            return _safe_int(match.group(1), 0)
+    expire_text = _clean_loading(item.get("expire"))
+    if expire_text:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                expire_at = datetime.strptime(expire_text[:19], fmt)
+            except ValueError:
+                continue
+            return int((expire_at - datetime.now()).total_seconds() // 86400)
+    return None
 
 
 def _version_tuple(text: Any) -> Tuple[int, ...]:
@@ -561,7 +605,7 @@ class OpenClashMonitor(_PluginBase):
         "插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.3.0"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "openclashmonitor_"
@@ -591,6 +635,13 @@ class OpenClashMonitor(_PluginBase):
     _interval: int = 10
     _node_limit: int = 15
     _querylog_limit: int = 20
+    _actions_enabled: bool = True
+    _trend_days: int = 7
+    _alert_enabled: bool = True
+    _alert_offline_percent: int = 60
+    _alert_upstream_errors: int = 3
+    _alert_days: int = 7
+    _alert_cooldown: int = 180
     _timeout: float = 8.0
 
     _refreshing: bool = False
@@ -632,6 +683,13 @@ class OpenClashMonitor(_PluginBase):
         self._node_limit = max(1, min(_safe_int(merged.get("node_limit"), 15), 200))
         self._querylog_limit = max(0, min(_safe_int(merged.get("querylog_limit"), 20), 200))
         self._timeout = float(max(3, min(_safe_int(merged.get("timeout"), 8), 60)))
+        self._actions_enabled = bool(merged.get("actions_enabled", True))
+        self._trend_days = max(1, min(_safe_int(merged.get("trend_days"), 7), 60))
+        self._alert_enabled = bool(merged.get("alert_enabled", True))
+        self._alert_offline_percent = max(1, min(_safe_int(merged.get("alert_offline_percent"), 60), 100))
+        self._alert_upstream_errors = max(1, min(_safe_int(merged.get("alert_upstream_errors"), 3), 100))
+        self._alert_days = max(0, min(_safe_int(merged.get("alert_days"), 7), 60))
+        self._alert_cooldown = max(0, min(_safe_int(merged.get("alert_cooldown"), 180), 10080))
 
         if not self._enabled:
             return
@@ -682,7 +740,7 @@ class OpenClashMonitor(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """注册 ``/openclash`` 远程命令。"""
+        """注册状态查询与一键操作命令。"""
         if EventType is None:
             return []
         return [
@@ -692,19 +750,100 @@ class OpenClashMonitor(_PluginBase):
                 "desc": "OpenClash 监控：输出当前状态摘要",
                 "category": "插件命令",
                 "data": {"action": "openclashmonitor_summary"},
-            }
+            },
+            {
+                "cmd": "/openclash_trend",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 监控：输出最近趋势（在线节点、拦截率、上游延迟）",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_trend"},
+            },
+            {
+                "cmd": "/openclash_restart",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 操作：重启 OpenClash",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_restart"},
+            },
+            {
+                "cmd": "/openclash_start",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 操作：启动 OpenClash",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_start"},
+            },
+            {
+                "cmd": "/openclash_stop",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 操作：停止 OpenClash",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_stop"},
+            },
+            {
+                "cmd": "/openclash_rule",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 操作：切换规则模式，用法 /openclash_rule rule|global|direct",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_rule"},
+            },
+            {
+                "cmd": "/openclash_flush",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 操作：清理 DNS 与 Fake-IP 缓存",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_flush"},
+            },
+            {
+                "cmd": "/openclash_node",
+                "event": EventType.PluginAction,
+                "desc": "OpenClash 操作：切换节点，用法 /openclash_node 组名 节点名",
+                "category": "插件命令",
+                "data": {"action": "openclashmonitor_node"},
+            },
         ]
 
     def run_command(self, event: Any) -> None:
-        """响应 ``/openclash`` 命令。"""
+        """响应插件命令。"""
         data = getattr(event, "event_data", None)
-        if not isinstance(data, dict) or data.get("action") != "openclashmonitor_summary":
+        if not isinstance(data, dict):
             return
-        snap = self.__cached()
-        if not snap:
-            self.post_message(title="OpenClash 监控", text="暂无数据，请先在插件页面等待一次采集完成。")
+        action = str(data.get("action") or "")
+        if not action.startswith("openclashmonitor_"):
             return
-        self.post_message(title="OpenClash 监控", text=self.__summary_text(snap))
+        name = action[len("openclashmonitor_"):]
+
+        if name == "summary":
+            snap = self.__cached()
+            if not snap:
+                self.post_message(title="OpenClash 监控", text="暂无数据，请先在插件页面等待一次采集完成。")
+                return
+            self.post_message(title="OpenClash 监控", text=self.__summary_text(snap))
+            return
+
+        if name == "trend":
+            self.post_message(title="OpenClash 趋势", text=self.__trend_text())
+            return
+
+        arg_str = str(data.get("arg_str") or data.get("text") or "").strip()
+        args = [item for item in re.split(r"\s+", arg_str) if item]
+        if name in ("start", "stop", "restart", "flush"):
+            result = self.__perform_action(name if name != "flush" else "flush")
+        elif name == "rule":
+            value = args[0].lower() if args else "rule"
+            result = self.__perform_action("rule", value)
+        elif name == "node":
+            if len(args) < 2:
+                self.post_message(title="OpenClash 操作", text="用法：/openclash_node 组名 节点名")
+                return
+            result = self.__perform_action("node", " ".join(args[1:]), args[0])
+        else:
+            return
+        title = "OpenClash 操作成功" if result.get("ok") else "OpenClash 操作失败"
+        text = str(result.get("message") or "")
+        detail = result.get("detail")
+        if detail and not result.get("ok"):
+            text = f"{text}\n{detail}"
+        self.post_message(title=title, text=text or "已完成")
 
     if eventmanager is not None and EventType is not None:
         run_command = eventmanager.register(EventType.PluginAction)(run_command)
@@ -765,6 +904,27 @@ class OpenClashMonitor(_PluginBase):
                 "auth": "bear",
                 "summary": "立即探测上游 DNS 健康状态",
             },
+            {
+                "path": "/trend",
+                "endpoint": self.api_trend,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取节点在线、拦截率与上游延迟的趋势序列",
+            },
+            {
+                "path": "/alerts",
+                "endpoint": self.api_alerts,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取当前异常提醒列表",
+            },
+            {
+                "path": "/action",
+                "endpoint": self.api_action,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "一键操作：start/stop/restart/rule/flush/flush_smart/close/switch_config/node",
+            },
         ]
 
     def api_snapshot(self) -> Dict[str, Any]:
@@ -794,6 +954,66 @@ class OpenClashMonitor(_PluginBase):
     def api_probe(self) -> Dict[str, Any]:
         """重新探测上游 DNS。"""
         return {"timestamp": _now_text(), "probe": self.__collect_probe()}
+
+    def api_trend(self) -> Dict[str, Any]:
+        """返回趋势序列，附带可直接绘图的 series。"""
+        snapshot = self.__cached() or {}
+        points = [item for item in (snapshot.get("trend") or []) if isinstance(item, dict)]
+        return {
+            "timestamp": snapshot.get("timestamp") or "",
+            "days": self._trend_days,
+            "points": points,
+            "series": {
+                "nodes": {
+                    "categories": [str(item.get("hour") or "") for item in points],
+                    "alive": [item.get("alive") for item in points],
+                    "total": [item.get("total") for item in points],
+                },
+                "dns": {
+                    "categories": [str(item.get("hour") or "") for item in points],
+                    "blocked_percent": [item.get("blocked_percent") for item in points],
+                    "avg_ms": [item.get("avg_ms") for item in points],
+                },
+            },
+        }
+
+    def api_alerts(self) -> Dict[str, Any]:
+        """返回当前告警列表。"""
+        snapshot = self.__cached() or {}
+        alerts = [item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]
+        return {
+            "timestamp": snapshot.get("timestamp") or "",
+            "count": len(alerts),
+            "alerts": alerts,
+        }
+
+    def api_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """执行一键操作。
+
+        body: ``{"action": "rule", "value": "global"}``；
+        切换节点用 ``{"action": "node", "group": "节点选择", "value": "香港 01"}``；
+        破坏性操作建议带 ``"confirm": true``。
+        """
+        data = payload if isinstance(payload, dict) else {}
+        action = str(data.get("action") or "").strip().lower()
+        if not action:
+            return {"timestamp": _now_text(), "ok": False, "message": "缺少 action 参数",
+                    "available": list(_ACTION_NAMES)}
+        if action in ("stop", "restart", "switch_config", "close") and not bool(data.get("confirm")):
+            return {"timestamp": _now_text(), "ok": False,
+                    "message": f"{_ACTION_NAMES.get(action, action)}需要 confirm=true 才会执行"}
+        result = self.__perform_action(
+            action,
+            str(data.get("value") or ""),
+            str(data.get("group") or ""),
+        )
+        result["timestamp"] = _now_text()
+        if result.get("ok"):
+            try:
+                self.refresh()
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"OpenClash 监控：操作后刷新失败 {err}")
+        return result
 
     # ------------------------------------------------------------------
     # 配置表单
@@ -927,6 +1147,41 @@ class OpenClashMonitor(_PluginBase):
                                                           "placeholder": "8"}}),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__form_col(3, {"component": "VSwitch",
+                                                "props": {"model": "actions_enabled",
+                                                          "label": "启用一键操作",
+                                                          "hint": "命令与 API 可重启、切规则、切节点",
+                                                          "persistentHint": True}}),
+                            self.__form_col(3, {"component": "VSwitch",
+                                                "props": {"model": "alert_enabled", "label": "启用异常提醒"}}),
+                            self.__form_col(3, {"component": "VTextField",
+                                                "props": {"model": "trend_days", "label": "趋势保留天数",
+                                                          "placeholder": "7"}}),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__form_col(3, {"component": "VTextField",
+                                                "props": {"model": "alert_offline_percent",
+                                                          "label": "掉线比例阈值(%)",
+                                                          "placeholder": "60"}}),
+                            self.__form_col(3, {"component": "VTextField",
+                                                "props": {"model": "alert_upstream_errors",
+                                                          "label": "上游失败次数阈值",
+                                                          "placeholder": "3"}}),
+                            self.__form_col(3, {"component": "VTextField",
+                                                "props": {"model": "alert_days", "label": "订阅到期提醒(天)",
+                                                          "placeholder": "7"}}),
+                            self.__form_col(3, {"component": "VTextField",
+                                                "props": {"model": "alert_cooldown",
+                                                          "label": "告警冷却(分钟)",
+                                                          "placeholder": "180"}}),
+                        ],
+                    },
                 ],
             }
         ], dict(DEFAULT_CONFIG)
@@ -958,6 +1213,16 @@ class OpenClashMonitor(_PluginBase):
 
         snapshot["timestamp"] = _now_text()
         try:
+            snapshot["trend"] = self.__append_trend(snapshot)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"OpenClash 监控：更新趋势失败 {err}")
+            snapshot["trend"] = []
+        try:
+            snapshot["alerts"] = self.__evaluate_alerts(snapshot)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"OpenClash 监控：生成告警失败 {err}")
+            snapshot["alerts"] = []
+        try:
             self.save_data(_SNAPSHOT_KEY, snapshot)
         except Exception as err:  # noqa: BLE001
             logger.error(f"OpenClash 监控：保存快照失败 {err}")
@@ -965,6 +1230,10 @@ class OpenClashMonitor(_PluginBase):
             self.__notify(snapshot)
         except Exception as err:  # noqa: BLE001
             logger.warning(f"OpenClash 监控：发送通知失败 {err}")
+        try:
+            self.__notify_alerts(snapshot)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"OpenClash 监控：发送告警失败 {err}")
         return snapshot
 
     def __collect(self) -> Dict[str, Any]:
@@ -1968,6 +2237,291 @@ class OpenClashMonitor(_PluginBase):
         return results
 
     # ------------------------------------------------------------------
+    # 趋势与异常提醒
+    # ------------------------------------------------------------------
+
+    def __append_trend(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """把本次采集按小时并入趋势序列，保留最近 trend_days 天。"""
+        now = time.time()
+        previous = self.__cached() or {}
+        raw = previous.get("trend") if isinstance(previous.get("trend"), list) else []
+        nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), dict) else {}
+        dns = snapshot.get("dns") if isinstance(snapshot.get("dns"), dict) else {}
+        clash = snapshot.get("clash") if isinstance(snapshot.get("clash"), dict) else {}
+        point = {
+            "ts": now,
+            "hour": time.strftime("%Y-%m-%d %H", time.localtime(now)),
+            "alive": _safe_int(nodes.get("alive"), 0),
+            "total": _safe_int(nodes.get("total"), 0),
+            "blocked_percent": round(_safe_float(dns.get("blocked_percent"), 0.0), 2),
+            "avg_ms": round(_safe_float(dns.get("avg_ms"), 0.0), 2),
+            "queries": _safe_int(dns.get("queries"), 0),
+            "connections": _safe_int(clash.get("connections"), 0),
+            "cpu": round(_safe_float(clash.get("cpu_percent"), 0.0), 2),
+        }
+        merged: Dict[str, Dict[str, Any]] = {}
+        for item in raw:
+            if isinstance(item, dict) and item.get("hour"):
+                merged[str(item.get("hour"))] = dict(item)
+        merged[str(point["hour"])] = point
+        entries = sorted(merged.values(), key=lambda item: _safe_float(item.get("ts"), 0.0))
+        cutoff = now - self._trend_days * 86400
+        entries = [item for item in entries if _safe_float(item.get("ts"), 0.0) >= cutoff]
+        return entries[-_TREND_MAX_POINTS:]
+
+    def __evaluate_alerts(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """根据快照生成异常提醒列表（只在变化/冷却到期时推送）。"""
+        alerts: List[Dict[str, Any]] = []
+
+        errors = [str(item) for item in (snapshot.get("errors") or []) if item]
+        if errors:
+            alerts.append({
+                "key": "collect",
+                "level": "warning",
+                "title": "采集数据不完整",
+                "text": "；".join(errors)[:300],
+            })
+
+        nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), dict) else {}
+        total = _safe_int(nodes.get("total"), 0)
+        alive = _safe_int(nodes.get("alive"), 0)
+        if total > 0:
+            offline_percent = (total - alive) * 100.0 / total
+            if offline_percent >= self._alert_offline_percent:
+                alerts.append({
+                    "key": "offline",
+                    "level": "error",
+                    "title": "节点在线率偏低",
+                    "text": f"在线 {alive}/{total}，掉线 {offline_percent:.1f}%（阈值 {self._alert_offline_percent}%）",
+                })
+
+        dns = snapshot.get("dns") if isinstance(snapshot.get("dns"), dict) else {}
+        for row in (dns.get("upstream_health") or []):
+            if not isinstance(row, dict):
+                continue
+            failures = _safe_int(row.get("errors"), 0) + _safe_int(row.get("timeouts"), 0)
+            if failures < self._alert_upstream_errors:
+                continue
+            server = str(row.get("server") or "?")
+            detail = str(row.get("error") or "").strip()
+            alerts.append({
+                "key": f"upstream:{server}",
+                "level": "warning",
+                "title": "上游 DNS 异常",
+                "text": f"{server}（{row.get('group') or '默认'}）失败 {failures} 次" + (f"：{detail[:160]}" if detail else ""),
+            })
+
+        subscription = snapshot.get("subscription") if isinstance(snapshot.get("subscription"), dict) else {}
+        for item in (subscription.get("items") or []):
+            left = _days_left(item)
+            if left is None:
+                continue
+            if left > self._alert_days:
+                continue
+            name = str(item.get("name") or "订阅")
+            if left <= 0:
+                alerts.append({
+                    "key": f"sub:{name}",
+                    "level": "error",
+                    "title": "订阅已过期",
+                    "text": f"{name} 已过期，请及时续费",
+                })
+            else:
+                alerts.append({
+                    "key": f"sub:{name}",
+                    "level": "warning",
+                    "title": "订阅即将到期",
+                    "text": f"{name} 剩余 {left} 天（阈值 {self._alert_days} 天）",
+                })
+        return alerts
+
+    def __notify_alerts(self, snapshot: Dict[str, Any]) -> None:
+        """把新出现的告警推送给通知渠道，按冷却时间去重。"""
+        if not self._enabled or not self._alert_enabled:
+            return
+        alerts = [item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]
+        if not alerts:
+            return
+        now = time.time()
+        state = self.get_data(_ALERT_KEY)
+        state = dict(state) if isinstance(state, dict) else {}
+        state = {key: value for key, value in state.items()
+                 if now - _safe_float(value, 0.0) < _ALERT_STATE_KEEP_SECONDS}
+        cooldown = self._alert_cooldown * 60
+        fired: List[Dict[str, Any]] = []
+        for alert in alerts:
+            key = str(alert.get("key") or "")
+            if not key:
+                continue
+            last = _safe_float(state.get(key), 0.0)
+            if cooldown and now - last < cooldown:
+                continue
+            fired.append(alert)
+        if not fired:
+            return
+        lines = [f"· {item.get('title')}：{item.get('text')}" for item in fired]
+        self.post_message(
+            mtype=getattr(NotificationType, "Plugin", None) if NotificationType else None,
+            title="OpenClash 监控告警",
+            text="\n".join(lines)[:1200],
+        )
+        for alert in fired:
+            state[str(alert.get("key"))] = now
+        self.save_data(_ALERT_KEY, state)
+
+    # ------------------------------------------------------------------
+    # 一键操作
+    # ------------------------------------------------------------------
+
+    def __action_targets(self) -> Tuple[str, str]:
+        """返回 Clash API 基址与密钥，优先取快照里已解析的结果。"""
+        snapshot = self.__cached() or {}
+        clash = snapshot.get("clash") if isinstance(snapshot.get("clash"), dict) else {}
+        base = str(clash.get("api_url") or "") or self._clash_url
+        secret = self._clash_secret
+        if base and secret:
+            return base, secret
+        status, _err = self.__luci_get("status")
+        if isinstance(status, dict):
+            if not secret:
+                secret = str(status.get("dase") or "").strip()
+            if not base and self._luci_url:
+                parts = urllib.parse.urlsplit(self._luci_url)
+                host = parts.hostname or ""
+                port = _safe_int(status.get("cn_port"), 9090) or 9090
+                if host:
+                    base = f"{parts.scheme or 'http'}://{host}:{port}"
+        return base, secret
+
+    def __clash_send(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None,
+                     timeout: Optional[float] = None) -> Tuple[bool, str]:
+        """向 Clash API 发送写操作。"""
+        base, secret = self.__action_targets()
+        if not base:
+            return False, "未配置 Clash API 地址"
+        headers = {"Content-Type": "application/json"}
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
+        result = http_request(
+            method, f"{base}{path}",
+            headers=headers,
+            body=payload if payload is not None else {},
+            timeout=timeout or self._timeout,
+        )
+        if result["status"] is None:
+            return False, str(result["error"] or "请求失败")
+        if result["status"] in (401, 403):
+            return False, "Clash API 鉴权失败，请检查密钥"
+        if result["status"] >= 400:
+            return False, f"Clash API 返回 HTTP {result['status']}"
+        return True, ""
+
+    def __luci_post(self, action: str, form: Optional[Dict[str, Any]] = None,
+                    timeout: Optional[float] = None) -> Tuple[Any, Optional[str]]:
+        """向 OpenClash 的 LuCI 接口提交写请求，必要时自动登录。"""
+        if not self._luci_url:
+            return None, "未配置路由器地址"
+        url = f"{self._luci_url}/cgi-bin/luci/admin/services/openclash/{action}"
+        for attempt in (0, 1):
+            result = http_request(
+                "POST", url,
+                headers={"X-Requested-With": "XMLHttpRequest"},
+                body=dict(form or {}),
+                form=True,
+                timeout=timeout or self._timeout,
+                cookies=self.__cookie_jar(),
+            )
+            if result["cookies"]:
+                self.__cookie_jar().update(result["cookies"])
+            if result["status"] in (401, 403):
+                if attempt == 0 and self.__luci_login():
+                    continue
+                return None, f"需要登录（HTTP {result['status']}）"
+            if result["error"] and result["status"] is None:
+                return None, str(result["error"])
+            data = result["data"]
+            if isinstance(data, (dict, list)):
+                if isinstance(data, dict) and data.get("error"):
+                    return None, str(data.get("error"))[:200]
+                return data, None
+            text = (result["text"] or "").strip()
+            lowered = text[:400].lower()
+            if "<html" in lowered or "<!doctype" in lowered:
+                if attempt == 0 and self.__luci_login():
+                    continue
+                return None, "LuCI 需要登录：请填写用户名密码，或粘贴浏览器里的 sysauth cookie"
+            if result["status"] is not None and result["status"] >= 400:
+                return None, f"HTTP {result['status']}"
+            if text:
+                return {"raw": text[:200]}, None
+            return {}, None
+        return None, "LuCI 请求失败"
+
+    def __perform_action(self, action: str, value: str = "", group: str = "") -> Dict[str, Any]:
+        """执行白名单内的一键操作。"""
+        name = str(action or "").strip().lower()
+        if name == "switch":
+            name = "switch_config"
+        value = str(value or "").strip()
+        group = str(group or "").strip()
+        if name not in _ACTION_NAMES:
+            return {"action": name, "ok": False, "message": f"不支持的操作：{name or '(空)'}",
+                    "detail": "可用操作：" + "、".join(_ACTION_NAMES),
+                    "available": list(_ACTION_NAMES)}
+        if not self._actions_enabled:
+            return {"action": name, "ok": False, "message": "一键操作已在配置中关闭"}
+
+        if name in ("start", "stop", "restart"):
+            data, err = self.__luci_post("action", {"action": name}, timeout=max(self._timeout, 20))
+            if err:
+                return {"action": name, "ok": False, "message": f"{_ACTION_NAMES[name]}失败", "detail": err}
+            return {"action": name, "ok": True, "message": f"已提交{_ACTION_NAMES[name]}", "detail": data}
+
+        if name == "rule":
+            if value not in _RULE_MODES:
+                return {"action": name, "ok": False, "message": f"规则模式必须是 {'/'.join(_RULE_MODES)}",
+                        "detail": value}
+            data, err = self.__luci_post("switch_rule_mode", {"rule_mode": value})
+            if err:
+                return {"action": name, "ok": False, "message": "切换规则模式失败", "detail": err}
+            return {"action": name, "ok": True, "message": f"规则模式已切换为 {value}", "detail": data}
+
+        if name in ("flush", "flush_smart"):
+            luci_action = "flush_dns_cache" if name == "flush" else "flush_smart_cache"
+            data, err = self.__luci_post(luci_action, {})
+            if err:
+                return {"action": name, "ok": False, "message": f"{_ACTION_NAMES[name]}失败", "detail": err}
+            detail: Dict[str, Any] = {"luci": data}
+            if name == "flush":
+                ok, clash_err = self.__clash_send("POST", "/cache/dns/flush", {})
+                detail["clash"] = "已清理" if ok else clash_err
+            return {"action": name, "ok": True, "message": f"已提交{_ACTION_NAMES[name]}", "detail": detail}
+
+        if name == "close":
+            data, err = self.__luci_post("close_all_connection", {})
+            if err:
+                return {"action": name, "ok": False, "message": f"{_ACTION_NAMES[name]}失败", "detail": err}
+            return {"action": name, "ok": True, "message": "已关闭全部连接", "detail": data}
+
+        if name == "switch":
+            if not value:
+                return {"action": name, "ok": False, "message": "需要指定配置文件名", "detail": ""}
+            data, err = self.__luci_post("switch_config", {"config_file": value}, timeout=max(self._timeout, 30))
+            if err:
+                return {"action": name, "ok": False, "message": "切换配置文件失败", "detail": err}
+            return {"action": name, "ok": True, "message": f"已切换到 {value}", "detail": data}
+
+        # node：切换策略组当前节点
+        if not group or not value:
+            return {"action": name, "ok": False, "message": "需要同时提供组名与节点名",
+                    "detail": "示例：/openclash_node 节点选择 香港 01"}
+        path = "/proxies/" + urllib.parse.quote(group, safe="")
+        ok, err = self.__clash_send("PUT", path, {"name": value})
+        if not ok:
+            return {"action": name, "ok": False, "message": "切换节点失败", "detail": err}
+        return {"action": name, "ok": True, "message": f"{group} 已切换到 {value}"}
+
+    # ------------------------------------------------------------------
     # 通知
     # ------------------------------------------------------------------
 
@@ -2022,6 +2576,12 @@ class OpenClashMonitor(_PluginBase):
                                "text": "首次采集进行中，请等待几秒后刷新本页。"}}]
 
         content: List[dict] = [self.__status_alert(snapshot), self.__overview_row(snapshot)]
+        alerts_card = self.__alerts_card(snapshot)
+        if alerts_card:
+            content.append(alerts_card)
+        trend_card = self.__trend_card(snapshot)
+        if trend_card:
+            content.append(trend_card)
         for card in (
             self.__version_card(snapshot),
             self.__node_group_card(snapshot),
@@ -2033,6 +2593,7 @@ class OpenClashMonitor(_PluginBase):
         ):
             if card:
                 content.append(card)
+        content.append(self.__actions_card())
         return content
 
     def __status_alert(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -2114,6 +2675,139 @@ class OpenClashMonitor(_PluginBase):
                  ]},
             ],
         }
+
+    def __alerts_card(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """异常提醒卡片。"""
+        alerts = [item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]
+        content: List[Dict[str, Any]] = [
+            {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+             "text": f"异常提醒（{len(alerts)}）"},
+        ]
+        if not alerts:
+            content.append({"component": "VAlert",
+                            "props": {"type": "success", "variant": "tonal",
+                                      "text": "当前没有触发任何告警。"}})
+        else:
+            for item in alerts:
+                level = str(item.get("level") or "warning")
+                content.append({"component": "VAlert",
+                                "props": {"type": "error" if level == "error" else "warning",
+                                          "variant": "tonal", "class": "mb-2",
+                                          "title": str(item.get("title") or ""),
+                                          "text": str(item.get("text") or "")}})
+        content.append({"component": "div",
+                        "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                        "text": f"阈值：掉线 ≥ {self._alert_offline_percent}%、上游失败 ≥ "
+                                f"{self._alert_upstream_errors} 次、订阅剩余 ≤ {self._alert_days} 天；"
+                                f"同一告警 {self._alert_cooldown} 分钟内只推送一次。"})
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 12},
+            "content": [
+                {"component": "VCard", "props": {"variant": "tonal", "class": "mb-3"},
+                 "content": [{"component": "VCardText", "content": content}]},
+            ],
+        }
+
+    def __trend_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """趋势图卡片：节点在线数与 DNS 指标。"""
+        points = [item for item in (snapshot.get("trend") or []) if isinstance(item, dict)]
+        if len(points) < 2:
+            return None
+        categories = [time.strftime("%m-%d %H:00", time.localtime(_safe_float(item.get("ts"), 0.0)))
+                      for item in points]
+        base_options = {
+            "chart": {"type": "line", "toolbar": {"show": False}, "zoom": {"enabled": False}},
+            "dataLabels": {"enabled": False},
+            "stroke": {"curve": "smooth", "width": 2},
+            "legend": {"show": True},
+            "noData": {"text": "暂无数据"},
+        }
+        node_options = dict(base_options)
+        node_options["xaxis"] = {"categories": categories, "labels": {"show": False}}
+        dns_options = dict(base_options)
+        dns_options["xaxis"] = {"categories": categories, "labels": {"show": False}}
+        dns_options["yaxis"] = [
+            {"title": {"text": "拦截率 %"}},
+            {"opposite": True, "title": {"text": "延迟 ms"}},
+        ]
+        node_chart = {
+            "component": "VApexChart",
+            "props": {
+                "height": 260,
+                "options": node_options,
+                "series": [
+                    {"name": "在线节点", "data": [_safe_int(item.get("alive"), 0) for item in points]},
+                    {"name": "节点总数", "data": [_safe_int(item.get("total"), 0) for item in points]},
+                ],
+            },
+        }
+        dns_chart = {
+            "component": "VApexChart",
+            "props": {
+                "height": 260,
+                "options": dns_options,
+                "series": [
+                    {"name": "拦截率 %", "data": [_safe_float(item.get("blocked_percent"), 0.0) for item in points]},
+                    {"name": "上游延迟 ms", "data": [_safe_float(item.get("avg_ms"), 0.0) for item in points]},
+                ],
+            },
+        }
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 12},
+            "content": [
+                {"component": "VCard", "props": {"variant": "tonal", "class": "mb-3"},
+                 "content": [
+                     {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                      "text": f"趋势（最近 {len(points)} 个采样点，按小时聚合，保留 {self._trend_days} 天）"},
+                     {"component": "VCardText",
+                      "content": [
+                          {"component": "VRow",
+                           "content": [
+                               {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [node_chart]},
+                               {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [dns_chart]},
+                           ]},
+                      ]},
+                 ]},
+            ],
+        }
+
+    def __actions_card(self) -> Dict[str, Any]:
+        """一键操作说明卡片。"""
+        rows: List[Dict[str, Any]] = [
+            {"component": "thead",
+             "content": [{"component": "tr",
+                          "content": [{"component": "th", "text": text}
+                                      for text in ("操作", "远程命令", "API")]}]},
+            {"component": "tbody", "content": []},
+        ]
+        entries = [
+            ("重启 OpenClash", "/openclash_restart", '{"action":"restart","confirm":true}'),
+            ("启动 / 停止", "/openclash_start、/openclash_stop", '{"action":"start"}'),
+            ("切换规则模式", "/openclash_rule rule|global|direct", '{"action":"rule","value":"global"}'),
+            ("切换节点", "/openclash_node 组名 节点名", '{"action":"node","group":"节点选择","value":"节点"}'),
+            ("清理 DNS 缓存", "/openclash_flush", '{"action":"flush"}'),
+            ("关闭全部连接", "—", '{"action":"close","confirm":true}'),
+            ("切换配置文件", "—", '{"action":"switch_config","value":"config.yaml","confirm":true}'),
+            ("查看趋势", "/openclash_trend", "GET /trend"),
+        ]
+        for name, command, api in entries:
+            rows[1]["content"].append(
+                {"component": "tr",
+                 "content": [
+                     {"component": "td", "props": {"class": "font-weight-medium"}, "text": name},
+                     {"component": "td", "props": {"style": "word-break: break-all;"}, "text": command},
+                     {"component": "td", "props": {"style": "word-break: break-all;"}, "text": api},
+                 ]}
+            )
+        caption = (
+            "页面为只读渲染，一键操作请用远程命令或 API 触发："
+            "curl -X POST \"<MoviePilot地址>/api/v1/plugin/OpenClashMonitor/action?apikey=<你的API密钥>\" "
+            "-H \"Content-Type: application/json\" -d '{\"action\":\"rule\",\"value\":\"global\"}'。"
+            + ("" if self._actions_enabled else "当前已在配置中关闭一键操作。")
+        )
+        return self.__table_card("一键操作", rows, cols=12, md=12, caption=caption)
 
     def __version_card(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """版本与更新对比卡片。"""
@@ -2620,6 +3314,15 @@ class OpenClashMonitor(_PluginBase):
              "props": {"type": alert_type, "variant": "tonal", "class": "mt-2",
                        "title": f"采集时间 {snapshot.get('timestamp') or '未知'}",
                        "text": alert_text}})
+        alerts = [item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]
+        if alerts:
+            content.append(
+                {"component": "VAlert",
+                 "props": {"type": "error" if any(str(item.get("level")) == "error" for item in alerts)
+                           else "warning",
+                           "variant": "tonal", "class": "mt-2",
+                           "title": f"告警 {len(alerts)} 条",
+                           "text": "；".join(str(item.get("title") or "") for item in alerts)[:220]}})
         if health_bits:
             content.append(
                 {"component": "div", "props": {"class": "mt-2"},
@@ -2683,13 +3386,32 @@ class OpenClashMonitor(_PluginBase):
                 f"可更新：内核 {versions.get('core_current')} → {versions.get('core_latest')}，"
                 f"插件 {versions.get('plugin_current')} → {versions.get('plugin_latest')}"
             )
-        if dns.get("provider") == "adguard" and dns.get("ok"):
+        if dns.get("provider") in ("adguard", "localdns") and dns.get("ok"):
             lines.append(
-                f"LocalDNS：查询 {dns.get('queries')} 次，拦截率 {dns.get('blocked_percent') or 0}%"
+                f"DNS：查询 {dns.get('queries')} 次，拦截率 {dns.get('blocked_percent') or 0}%"
             )
         errors = [str(e) for e in (snapshot.get("errors") or []) if e]
         if errors:
             lines.append("异常：" + "；".join(errors)[:200])
+        return "\n".join(lines)
+
+    def __trend_text(self) -> str:
+        """生成趋势摘要文本。"""
+        snapshot = self.__cached() or {}
+        points = [item for item in (snapshot.get("trend") or []) if isinstance(item, dict)]
+        if not points:
+            return "暂无趋势数据，等待几次采集后再试。"
+        recent = points[-6:]
+        lines = [f"最近 {len(points)} 个采样点（按小时聚合，保留 {self._trend_days} 天）："]
+        for item in recent:
+            lines.append(
+                f"{item.get('hour')}  在线 {item.get('alive')}/{item.get('total')}  "
+                f"拦截 {item.get('blocked_percent')}%  上游 {item.get('avg_ms')} ms  "
+                f"连接 {item.get('connections')}"
+            )
+        alerts = [item for item in (snapshot.get("alerts") or []) if isinstance(item, dict)]
+        if alerts:
+            lines.append("当前告警：" + "；".join(str(item.get("title")) for item in alerts))
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
