@@ -67,7 +67,7 @@ except Exception:  # noqa: BLE001
 # 常量
 # ---------------------------------------------------------------------------
 
-_UA = "MoviePilot-OpenClashMonitor/0.5.0"
+_UA = "MoviePilot-OpenClashMonitor/0.5.1"
 _SNAPSHOT_KEY = "snapshot"
 _NOTIFY_KEY = "notified_versions"
 _ALERT_KEY = "alert_state"
@@ -646,7 +646,7 @@ class OpenClashMonitor(_PluginBase):
         "插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "openclashmonitor_"
@@ -3942,10 +3942,13 @@ class OpenClashMonitor(_PluginBase):
             content.extend(extra)
         return {
             "component": "VCol",
-            "props": {"cols": cols, "md": md},
+            "props": {"cols": cols, "md": md, "class": "d-flex"},
             "content": [
-                {"component": "VCard", "props": {"variant": "tonal", "class": "mb-3"},
-                 "content": [{"component": "VCardText", "content": content}]},
+                {"component": "VCard",
+                 "props": {"variant": "tonal", "class": "mb-3 h-100 w-100 d-flex flex-column"},
+                 "content": [{"component": "VCardText",
+                              "props": {"class": "d-flex flex-column h-100"},
+                              "content": content}]},
             ],
         }
 
