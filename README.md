@@ -7,7 +7,7 @@
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
 | `OpenClashMonitor` | OpenClash 监控 | 0.4.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新；支持页面内嵌 zashboard、一键切换代理组、定时报告推送 Telegram/QQ/企业微信、趋势曲线与异常提醒 |
-| `SubtitleShield` | 字幕规范化 | 0.1.3 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
+| `SubtitleShield` | 字幕规范化 | 0.1.4 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化、下载完成即处理与 Emby 条目/库刷新 |
 
 ---
 
@@ -234,6 +234,7 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 | Emby 刷新 | 支持条目级（`POST /Library/Media/Updated`）、库级（`POST /Library/Refresh`）或两者 |
 | 定时与试跑 | `dry_run` 默认开启（只出计划不改文件），`limit` 默认 10 条，可先用少量样本验证 |
 | 历史库批量 | 扫描媒体库目录（不是下载目录），把历史遗留的不规范字幕一起统一 |
+| 下载完成即处理 | 订阅 MoviePilot 的 `TransferComplete` / `SubtitleTransferComplete` 事件：整理完成或字幕落盘后，只对事件涉及的目录做一次规范化并刷新 Emby（`event_enabled` 可关） |
 
 命名风格可切换：`tag_style=mp`（默认，`chi.zh-cn`/`zh-tw`，与 MoviePilot 一致）、`tag_style=chs_cht`（`chs`/`cht`）。
 
@@ -250,6 +251,7 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 | `scan_cron` | `0 4 * * *` | 定时扫描的 cron（五段式）；宿主缺少 CronTrigger 时自动退化为每 24 小时 |
 | `dry_run` | 开 | 只生成计划不改文件；关闭后才会真正重命名 |
 | `limit` | 10 | 单次最多处理多少条字幕（试跑用） |
+| `event_enabled` | 开 | 整理完成 / 字幕落盘完成后，立即规范化事件涉及的那个目录（只处理新入库内容）。事件处理同样遵守 `dry_run` 与 `auto_apply`：两者都允许写入时才真正改名，否则只记录计划 |
 | `tag_style` | `mp` | `mp`：`chi.zh-cn`/`zh-tw`；`chs`：`chs`/`cht` |
 | `keep_both` | 开 | 简体与繁体都保留；关闭时只留默认语言 |
 | `default_sub` | `zh-cn` | 命中的语言前面加 `.default` 前缀（与 MoviePilot 的 `DEFAULT_SUB` 一致） |
@@ -304,3 +306,4 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 5. Emby 条目级刷新依赖 Emby 允许 `POST /Library/Media/Updated`；部分旧版本可用库级刷新替代。
 6. **Emby 侧要看到新语言标签，`emby_path_map` 必须填对**：MoviePilot 容器里是 `/video/downloads/link/...`，Emby 容器里往往是 `/data/movie/...`，路径对不上时 Emby 收不到改动；同时建议保持 `emby_touch` 开启，否则只改字幕文件名不会触发 Emby 重新探测。
 7. 重命名是**原地改名**，不改变文件内容；如需回退，请以扫描计划里的「当前字幕」列为准手工改回。
+8. 下载完成事件的注册发生在插件加载时，**安装或升级插件后需要重启一次 MoviePilot（或重载插件）**钩子才会挂上；事件只处理 `media_roots` 范围内的目录。
