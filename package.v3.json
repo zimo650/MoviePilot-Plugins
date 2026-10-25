@@ -1,0 +1,17 @@
+{
+  "OpenClashMonitor": {
+    "name": "OpenClash 监控",
+    "description": "集中监控 OpenClash 的运行状态与规则模式、代理组与节点延迟、订阅剩余流量与到期时间、插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。",
+    "labels": "网络,工具,监控",
+    "version": "0.2.0",
+    "icon": "Moviepilot_A.png",
+    "author": "your-name",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v0.2.0": "适配真实 iStoreOS + OpenClash v0.48 + Mihomo + LocalDNS：新增 LocalDNS 采集（状态/上游健康/查询日志/版本）、provider 节点合并、LuCI 登录携带 Referer、CPU 改为读取 toolbar 的 cpu 字段",
+      "v0.1.0": "初始版本：OpenClash 运行状态、节点延迟、订阅流量、版本更新、LocalDNS 与上游 DNS 健康监控"
+    }
+  }
+}
