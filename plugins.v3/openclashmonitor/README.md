@@ -19,6 +19,9 @@
 | 趋势曲线 | 节点在线数/总数、拦截率与上游平均延迟的历史曲线（按小时聚合） | 每次采集写入快照的 `trend` 字段 |
 | 异常提醒 | 采集失败、节点掉线比例超阈值、某条上游 DNS 连续失败、订阅即将到期或已过期 | 采集结果 + 通知渠道 |
 | 一键操作 | 启动/停止/重启 OpenClash、切换规则模式、切换策略组节点、清理 DNS/Fake-IP 缓存、关闭全部连接、切换配置文件 | 远程命令 + REST API（页面只读，见下文） |
+| 内嵌面板 | 插件页里直接嵌入 zashboard，可在面板里切代理组、看连接与延迟 | zashboard 地址 + iframe（`html` 节点） |
+| 页面快捷切换 | 不用打开 zashboard，直接在插件页点按钮切规则模式、切策略组节点 | 页面 `events.click` → `POST /action_web` |
+| 定时报告 | 按 cron 把状态/节点/订阅/版本/DNS/告警汇总推送到 Telegram、QQ 或企业微信 | 调度任务 + `post_message(channel=...)` |
 | Clash 内置 DNS | enhanced-mode（fake-ip/redir-host）、nameserver、fallback、fake-ip-range | Clash API `/configs` |
 
 > 三路数据源互相独立：**Clash API 是必须的**（节点、运行状态、Clash DNS 都靠它）；**LuCI 是可选的**（只有订阅流量和插件/内核版本需要它）；**LocalDNS 也是可选的**（查询日志、上游健康与版本）。缺哪一路，其余部分照常工作，页面上会明确提示缺失原因。
@@ -63,6 +66,12 @@ cp -r openclashmonitor plugins.v3/
 | 上游失败次数阈值 | 单条上游累计失败/超时达到该次数时告警，默认 3 |
 | 订阅到期提醒(天) | 剩余天数小于等于该值时告警，默认 7（0 表示已过期也告警） |
 | 告警冷却(分钟) | 同一条告警在多久内不重复推送，默认 180 |
+| zashboard 面板地址 | 形如 `http://192.168.1.1:7116/`；留空则不显示内嵌面板 |
+| 面板高度(px) | 内嵌 iframe 的高度，默认 760 |
+| 启用定时报告 | 按 cron 主动推送监控报告 |
+| 定时表达式 | 五段式 cron（分 时 日 月 周），默认 `0 9 * * *` |
+| 通知渠道 | Telegram / QQ / 企业微信，可多选；留空跟随 MoviePilot 默认路由 |
+| 报告节点数 | 报告里列出最快的几个节点，默认 5 |
 
 ### 一键操作、趋势与异常提醒
 
@@ -88,6 +97,33 @@ curl -X POST "http://<MoviePilot地址>:3000/api/v1/plugin/OpenClashMonitor/acti
 趋势：每采集一次就往快照 `trend` 里写一个点（同小时覆盖），页面用两张折线图展示「在线节点/节点总数」和「拦截率 %/上游平均延迟 ms」。
 
 异常提醒：命中阈值时发通知（同一告警在冷却期内只发一次），同时页面上以红/黄告警条展示；告警状态存 7 天。
+
+### zashboard 面板与页面快捷切换
+
+插件页里直接内嵌 zashboard（`http://<你的zashboard地址>`），可以在里面切代理组、看连接与延迟；如果浏览器或反向代理禁止 iframe 嵌入，页面上有「在新窗口打开」按钮。
+
+面板下方还有一组纯页面按钮（不需要打开 zashboard）：
+
+- 一行「规则模式」按钮，点击即切换 `rule` / `global` / `direct`；
+- 每个策略组（在线数最多的前 4 组）列出最快 8 个节点，点一下就把该组切到该节点，当前选中项高亮。
+
+这些按钮调用的是 `POST /action_web`（`auth: "bear"`，用登录态鉴权，所以在浏览器里点即可），动作与 `/action` 一致但 `rule`/`node`/`flush`/`flush_smart` 无需再带 `confirm`；`restart`、`stop` 之类的破坏性操作仍只在 `/action` 里提供并要求 `confirm`。配置里关掉「启用一键操作」后，这组按钮与所有操作接口都会消失/被拒绝。
+
+### 定时报告
+
+在配置里打开「启用定时报告」并填 cron（默认 `0 9 * * *`，五段式：分 时 日 月 周），插件会注册一个调度任务，按点把当次报告推到通知渠道：
+
+- 通知渠道可选 Telegram、QQ、企业微信，可多选；留空则走 MoviePilot 的默认通知路由（哪个渠道开了「插件」消息就发哪个）。
+- 报告内容：运行状态、连接/内存/CPU/负载、节点在线率与最快的若干节点、订阅流量与到期、三个组件的版本更新、LocalDNS 统计与上游异常、主动探测结果、当前告警。
+- 页面上有「立即发送报告」按钮，等价于 `POST /report`；不依赖定时开关，可以随时手动发一条。
+- 也可以发远程命令：`/openclash_report` 发一条到默认渠道，`/openclash_report_channels telegram,qq` 临时指定渠道。
+
+## 定时任务
+
+| 任务 | 触发 | 说明 |
+| --- | --- | --- |
+| `OpenClashMonitor.Refresh` | `interval`（采集间隔） | 采集一次并写入快照、趋势、告警 |
+| `OpenClashMonitor.Report` | `cron`（定时表达式） | 仅在「启用定时报告」时注册 |
 
 ### 关于节点来源（重要）
 
@@ -119,7 +155,7 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 
 ## 对外 API
 
-全部 `GET`，路径前缀 `/api/v1/plugin/OpenClashMonitor`：
+全部 `GET`（最后三个为 `POST`），路径前缀 `/api/v1/plugin/OpenClashMonitor`：
 
 | 路径 | 说明 |
 | --- | --- |
@@ -133,9 +169,11 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 | `/trend` | 趋势曲线数据（节点、拦截率、上游延迟） |
 | `/alerts` | 当前告警列表 |
 | `POST /action` | 执行一键操作（`auth: apikey`，body 见上） |
+| `POST /action_web` | 页面按钮用的一键操作（`auth: bear`，`rule`/`node`/`flush`/`flush_smart` 免 `confirm`） |
+| `POST /report` | 立即发送报告（`auth: bear`，body 可带 `{"channels":["telegram"]}` 临时指定渠道） |
 
-Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势，
-另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`。
+Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势、`/openclash_report` 立即发一条报告，
+另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`、`/openclash_report_channels`。
 
 ## 已知限制
 
@@ -155,4 +193,8 @@ Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_tr
 7. **一键操作会真实改变路由器状态**：重启/停止 OpenClash、关闭全部连接、切换配置文件会短暂断网，
    请确认后再执行；不确定时先把「启用一键操作」关掉。
 8. **趋势数据存在插件数据目录里**：MoviePilot 重装或清理 `plugin_data` 会丢失历史点，重新采集后会从头累积。
+9. **内嵌面板受浏览器/X-Frame-Options 影响**：zashboard 本身允许 iframe，但如果你在前面加了带 `X-Frame-Options: DENY`
+   的反向代理，面板会空白，请用「在新窗口打开」。
+10. **定时报告依赖宿主的 CronTrigger**：APScheduler 缺失时插件只会在日志里告警并退化为只能手动发报告。
+    报告走 MoviePilot 的「插件」消息类型，请确认对应渠道的插件消息开关是打开的。
 
