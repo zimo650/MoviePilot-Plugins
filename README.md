@@ -7,7 +7,7 @@
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
 | `OpenClashMonitor` | OpenClash 监控 | 0.4.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新；支持页面内嵌 zashboard、一键切换代理组、定时报告推送 Telegram/QQ/企业微信、趋势曲线与异常提醒 |
-| `SubtitleShield` | 字幕规范化 | 0.1.1 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
+| `SubtitleShield` | 字幕规范化 | 0.1.2 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
 
 ---
 
@@ -258,6 +258,8 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 | `min_chars` | 20 | 正文有效字符数少于此值不做内容判定 |
 | `emby_enabled` / `emby_url` / `emby_apikey` | 空 | Emby 地址与 API Key |
 | `emby_refresh_mode` | `item` | `item` 条目级、`library` 库级、`both` 两者 |
+| `emby_path_map` | 空 | 路径映射，MoviePilot 容器路径 → Emby 看到的路径，一行一条或多条用逗号分隔，例：`/video/downloads/link/movie:/data/movie,/video/downloads/link/tv:/data/tv`。两个容器的挂载点不同时必须填，否则 Emby 收到的是它不认识的路径 |
+| `emby_touch` | 开 | 改名后 `utime` 更新一次视频文件时间戳：Emby 的增量扫描只看媒体文件的变化，不动视频就不会重新探测外挂字幕 |
 | `max_depth` | 4 | 目录递归深度 |
 | `timeout` | 10 | HTTP 超时（秒） |
 | `notify` | 开 | 扫描/执行结果推送到 MoviePilot 通知渠道 |
@@ -298,4 +300,5 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 3. `keep_both` 关闭后，被丢弃的语言只会进「已跳过」列表，不会自动删除文件。
 4. `dry_run` 默认开启，首次使用请先 `/subtitleguard_scan` 看计划，确认无误再关掉试跑少量。
 5. Emby 条目级刷新依赖 Emby 允许 `POST /Library/Media/Updated`；部分旧版本可用库级刷新替代。
-6. 重命名是**原地改名**，不改变文件内容；如需回退，请以扫描计划里的「当前字幕」列为准手工改回。
+6. **Emby 侧要看到新语言标签，`emby_path_map` 必须填对**：MoviePilot 容器里是 `/video/downloads/link/...`，Emby 容器里往往是 `/data/movie/...`，路径对不上时 Emby 收不到改动；同时建议保持 `emby_touch` 开启，否则只改字幕文件名不会触发 Emby 重新探测。
+7. 重命名是**原地改名**，不改变文件内容；如需回退，请以扫描计划里的「当前字幕」列为准手工改回。
