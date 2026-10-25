@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.2"
+    plugin_version = "0.1.3"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -724,6 +724,8 @@ class SubtitleShield(_PluginBase):
              "summary": "扫描媒体库并生成规范化计划"},
             {"path": "/apply", "endpoint": self.api_apply, "methods": ["POST"], "auth": "bear",
              "summary": "按计划执行真实改名"},
+            {"path": "/refresh_emby", "endpoint": self.api_refresh_emby, "methods": ["POST"], "auth": "bear",
+             "summary": "把已规范化的条目重新推给 Emby（更新视频时间戳 + 通知目录改动）"},
             {"path": "/report", "endpoint": self.api_report, "methods": ["GET"], "auth": "apikey",
              "summary": "外部集成：返回最近一次报告"},
         ]
@@ -759,6 +761,43 @@ class SubtitleShield(_PluginBase):
     def api_report(self) -> Dict[str, Any]:
         return self.get_data("last_report") or {"message": "尚未运行"}
 
+    def api_refresh_emby(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        touch = bool(payload.get("touch", True))
+        return self.refresh_emby_all(touch=touch)
+
+    def refresh_emby_all(self, touch: bool = True) -> Dict[str, Any]:
+        """把已经规范化的目录重新推给 Emby：可选更新视频时间戳，再通知目录改动。"""
+        dirs: List[str] = []
+        touched = 0
+        for root in self.__roots():
+            if not os.path.isdir(root):
+                continue
+            for current, sub_dirs, files in os.walk(root):
+                sub_dirs[:] = [d for d in sub_dirs if d not in _SKIP_DIRS]
+                if os.path.basename(current) in _SKIP_DIRS:
+                    continue
+                subs = [f for f in files if os.path.splitext(f)[1].lower() in _SUB_EXTS]
+                if not any(_NORMALIZED_RE.search(f) for f in subs):
+                    continue
+                dirs.append(current)
+                if not touch:
+                    continue
+                for name in files:
+                    if os.path.splitext(name)[1].lower() not in _VIDEO_EXTS:
+                        continue
+                    try:
+                        os.utime(os.path.join(current, name), None)
+                        touched += 1
+                    except Exception as e:
+                        logger.debug(f"{self.plugin_name}：更新时间戳失败 {name} {e}")
+        dirs = sorted(set(dirs))
+        res = self.__refresh_emby(dirs) if dirs else None
+        out = {"timestamp": _now(), "dirs": len(dirs), "touched": touched, "emby": res}
+        self.save_data("last_refresh", out)
+        logger.info(f"{self.plugin_name}：已刷新 Emby，目录 {len(dirs)} 个，时间戳更新 {touched} 个")
+        return out
+
     # ------------------------------------------------------------- 命令
 
     @staticmethod
@@ -774,6 +813,9 @@ class SubtitleShield(_PluginBase):
             {"cmd": "/subtitleguard_apply", "event": EventType.PluginAction,
              "desc": "执行真实改名（可加数量，如 /subtitleguard_apply 10）", "category": "插件命令",
              "data": {"action": "subtitleshield_apply"}},
+            {"cmd": "/subtitleguard_refresh", "event": EventType.PluginAction,
+             "desc": "把已规范化的条目重新推给 Emby（更新视频时间戳 + 目录改动通知）", "category": "插件命令",
+             "data": {"action": "subtitleshield_refresh"}},
         ]
 
     def run_command(self, event: Any) -> None:
@@ -811,6 +853,14 @@ class SubtitleShield(_PluginBase):
             self.__message("字幕规范化完成",
                            f"改名 {result['applied']} 条，失败 {result['failed']} 条"
                            + (f"，Emby：{result.get('emby')}" if result.get("emby") else ""))
+            return
+        if name == "refresh":
+            if not self._emby_enabled:
+                self.__message("Emby 未启用", "请先在插件设置里打开「刷新 Emby」并填好地址与 API Key。")
+                return
+            res = self.refresh_emby_all(touch=True)
+            self.__message("Emby 刷新完成",
+                           f"目录 {res['dirs']} 个 · 时间戳更新 {res['touched']} 个 · Emby：{res.get('emby')}")
             return
 
     # ------------------------------------------------------------- 内部
@@ -910,6 +960,8 @@ _SKIP_DIRS = {"@eaDir", "#recycle", "System Volume Information", ".git", "__pyca
 
 _VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv", ".webm", ".rmvb", ".iso", ".m4v"}
 _SUB_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".smi", ".lrc"}
+# 已规范化的字幕名（本插件产出的目标名）
+_NORMALIZED_RE = re.compile(r"(?:\.default)?\.(?:chi\.zh-cn|zh-tw|chs|cht)\.[a-z0-9]+$", re.I)
 
 _TAG_STYLE_OPTIONS = [{"title": "MoviePilot 原生（.chi.zh-cn / .zh-tw）", "value": "mp"},
                       {"title": "chs / cht", "value": "chs_cht"}]
