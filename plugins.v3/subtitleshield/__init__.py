@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.6"
+    plugin_version = "0.2.0"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -104,6 +104,8 @@ class SubtitleShield(_PluginBase):
     _limit = 10
     _tag_style = "mp"
     _keep_both = True
+    _dedupe_duplicates = False
+    _dedupe_keep_default = True
     _default_sub = "zh-cn"
     _prefer_format = "ass,srt,ssa,vtt,sup"
     _content_detect = True
@@ -132,6 +134,8 @@ class SubtitleShield(_PluginBase):
         self._limit = max(1, min(_safe_int(config.get("limit"), 10), 500))
         self._tag_style = str(config.get("tag_style") or "mp")
         self._keep_both = bool(config.get("keep_both", True))
+        self._dedupe_duplicates = bool(config.get("dedupe_duplicates", False))
+        self._dedupe_keep_default = bool(config.get("dedupe_keep_default", True))
         self._default_sub = str(config.get("default_sub") or "zh-cn").strip().lower()
         self._prefer_format = str(config.get("prefer_format") or "ass,srt,ssa,vtt,sup")
         self._content_detect = bool(config.get("content_detect", True))
@@ -179,135 +183,80 @@ class SubtitleShield(_PluginBase):
     # ------------------------------------------------------------------ 表单
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(12, {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                                                                              "text": "首次使用请保持「只预览不写入」开启，先看计划表，确认无误再关闭它执行真实改名。"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._enabled, "label": "启用插件",
-                                                                             "density": "compact"}}),
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._dry_run, "label": "只预览不写入",
-                                                                             "density": "compact"}}),
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._auto_apply, "label": "定时任务自动执行",
-                                                                             "density": "compact"}}),
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._onlyonce, "label": "立即运行一次",
-                                                                             "density": "compact"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._notify, "label": "发送通知",
-                                                                             "density": "compact"}}),
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._dashboard, "label": "显示仪表板",
-                                                                             "density": "compact"}}),
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._keep_both, "label": "简繁共存",
-                                                                             "density": "compact"}}),
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._content_detect, "label": "读内容判定",
-                                                                             "density": "compact"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(12, {"component": "VTextarea", "props": {
-                                "modelValue": self._media_roots, "rows": 2, "label": "媒体库目录（每行或用逗号分隔）",
-                                "placeholder": "/video/downloads/link/movie\n/video/downloads/link/tv",
-                                "hint": "填 MoviePilot 容器内可见的媒体库路径；建议只填库根目录，插件会递归扫描"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(4, {"component": "VTextField", "props": {"modelValue": self._scan_cron, "label": "定时表达式",
-                                                                                "placeholder": "0 4 * * *",
-                                                                                "hint": "cron 五段式：分 时 日 月 周"}}),
-                            self.__col(2, {"component": "VTextField", "props": {"modelValue": self._limit, "label": "每轮最多处理",
-                                                                                "type": "number", "hint": "试跑建议 10"}}),
-                            self.__col(2, {"component": "VTextField", "props": {"modelValue": self._max_depth, "label": "递归深度",
-                                                                                "type": "number"}}),
-                            self.__col(4, {"component": "VSelect", "props": {
-                                "modelValue": self._tag_style, "label": "语言标签风格",
-                                "items": _TAG_STYLE_OPTIONS, "hint": "mp = MoviePilot 原生（.chi.zh-cn / .zh-tw）"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, {"component": "VTextField", "props": {"modelValue": self._default_sub, "label": "默认字幕语言",
-                                                                                "hint": "匹配时加 .default 前缀，如 zh-cn"}}),
-                            self.__col(3, {"component": "VTextField", "props": {"modelValue": self._prefer_format, "label": "格式优先级",
-                                                                                "hint": "ass,srt,ssa,vtt,sup"}}),
-                            self.__col(2, {"component": "VSwitch", "props": {"modelValue": self._event_enabled, "label": "下载完成即处理",
-                                                                             "density": "compact",
-                                                                             "hint": "整理完成后立刻规范化该目录并刷新 Emby"}}),
-                            self.__col(2, {"component": "VTextField", "props": {"modelValue": self._min_chars, "label": "最少字符",
-                                                                                "type": "number"}}),
-                            self.__col(2, {"component": "VTextField", "props": {"modelValue": self._timeout, "label": "超时(秒)",
-                                                                                "type": "number"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(3, {"component": "VSwitch", "props": {"modelValue": self._emby_enabled, "label": "刷新 Emby",
-                                                                             "density": "compact"}}),
-                            self.__col(5, {"component": "VTextField", "props": {"modelValue": self._emby_url,
-                                                                                "label": "Emby 地址",
-                                                                                "placeholder": "http://192.168.1.1:8096"}}),
-                            self.__col(4, {"component": "VTextField", "props": {"modelValue": self._emby_apikey,
-                                                                                "label": "Emby API Key", "type": "password"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(4, {"component": "VSelect", "props": {
-                                "modelValue": self._emby_refresh_mode, "label": "刷新方式",
-                                "items": _EMBY_MODE_OPTIONS,
-                                "hint": "item = 只刷新改动条目；library = 库扫描；both = 两者"}}),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self.__col(8, {"component": "VTextarea", "props": {
-                                "modelValue": self._emby_path_map, "rows": 2, "label": "路径映射（MoviePilot 路径:Emby 路径）",
-                                "placeholder": "/video/downloads/link/movie:/data/movie\n/video/downloads/link/tv:/data/tv",
-                                "hint": "容器路径和 Emby 的不一致时必须填，否则 Emby 收不到改动通知"}}),
-                            self.__col(4, {"component": "VSwitch", "props": {
-                                "modelValue": self._emby_touch, "label": "更新视频时间戳",
-                                "density": "compact",
-                                "hint": "改字幕名后 Emby 不会自动重新扫描，需要动一下视频文件时间"}}),
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    self.__col(12, {"component": "VAlert", "props": {
-                        "type": "warning", "variant": "tonal",
-                        "text": "改名只影响字幕文件名，不会动视频内容；同语言重复字幕只提示、不删除。"}}),
-                ],
-            },
-        ], {
+        def switch(field: str, label: str, hint: str = "") -> Dict[str, Any]:
+            props = {"modelValue": getattr(self, field), "label": label, "density": "compact"}
+            if hint:
+                props["hint"] = hint
+            return {"component": "VSwitch", "props": props}
+
+        def text(field: str, label: str, *, hint: str = "", placeholder: str = "",
+                 type_: str = "text") -> Dict[str, Any]:
+            props = {"modelValue": getattr(self, field), "label": label, "type": type_,
+                     "variant": "outlined", "density": "compact"}
+            if hint:
+                props["hint"] = hint
+            if placeholder:
+                props["placeholder"] = placeholder
+            return {"component": "VTextField", "props": props}
+
+        def row(*cells: Tuple[int, Dict[str, Any]]) -> Dict[str, Any]:
+            return {"component": "VRow", "content": [self.__col(w, item) for w, item in cells]}
+
+        def alert(kind: str, text_value: str) -> Dict[str, Any]:
+            return row((12, {"component": "VAlert",
+                             "props": {"type": kind, "variant": "tonal", "class": "mb-2", "text": text_value}}))
+
+        form: List[dict] = [
+            alert("info", "首次使用请保持「只预览不写入」开启，先看计划表，确认无误再关闭它执行真实改名。"),
+            row((3, switch("_enabled", "启用插件")),
+                (3, switch("_dry_run", "只预览不写入")),
+                (3, switch("_auto_apply", "定时任务自动执行")),
+                (3, switch("_onlyonce", "立即运行一次"))),
+            row((3, switch("_notify", "发送通知")),
+                (3, switch("_dashboard", "显示仪表板")),
+                (3, switch("_keep_both", "简繁共存")),
+                (3, switch("_content_detect", "读内容判定"))),
+            row((3, switch("_event_enabled", "下载完成即处理", "整理完成后立刻规范化该目录")),
+                (3, switch("_dedupe_duplicates", "删多余同语言", "保留格式最优的一份，其余删除")),
+                (3, switch("_emby_enabled", "刷新 Emby")),
+                (3, switch("_emby_touch", "更新视频时间戳", "改字幕名后触发 Emby 重扫"))),
+            row((12, {"component": "VTextarea", "props": {
+                "modelValue": self._media_roots, "rows": 2, "label": "媒体库目录（每行或用逗号分隔）",
+                "placeholder": "/video/downloads/link/movie\n/video/downloads/link/tv",
+                "hint": "填 MoviePilot 容器内可见的媒体库路径；建议只填库根目录，插件会递归扫描"}})),
+            row((4, text("_scan_cron", "定时表达式", placeholder="0 4 * * *", hint="cron 五段式：分 时 日 月 周")),
+                (4, text("_limit", "每轮最多处理", type_="number", hint="试跑建议 10")),
+                (4, text("_max_depth", "递归深度", type_="number", hint="默认 4 层"))),
+            row((4, {"component": "VSelect", "props": {
+                "modelValue": self._tag_style, "label": "语言标签风格", "items": _TAG_STYLE_OPTIONS,
+                "variant": "outlined", "density": "compact",
+                "hint": "mp = MoviePilot 原生（.chi.zh-cn / .zh-tw）"}}),
+                (4, text("_default_sub", "默认字幕语言", hint="匹配时加 .default 前缀，如 zh-cn")),
+                (4, text("_prefer_format", "格式优先级", hint="ass,srt,ssa,vtt,sup"))),
+            row((4, text("_min_chars", "最少中文字符", type_="number", hint="低于此数不改名")),
+                (4, text("_timeout", "超时(秒)", type_="number")),
+                (4, text("_max_files", "扫描文件上限", type_="number", hint="默认 200000"))),
+            row((6, text("_emby_url", "Emby 地址", placeholder="http://192.168.1.1:8096")),
+                (6, text("_emby_apikey", "Emby API Key", type_="password"))),
+            row((6, {"component": "VSelect", "props": {
+                "modelValue": self._emby_refresh_mode, "label": "Emby 刷新方式", "items": _EMBY_MODE_OPTIONS,
+                "variant": "outlined", "density": "compact",
+                "hint": "item = 只刷新改动条目；library = 库扫描；both = 两者"}}),
+                (6, {"component": "VTextarea", "props": {
+                    "modelValue": self._emby_path_map, "rows": 2, "label": "路径映射（MoviePilot 路径:Emby 路径）",
+                    "placeholder": "/video/downloads/link/movie:/data/movie\n/video/downloads/link/tv:/data/tv",
+                    "hint": "容器路径和 Emby 的不一致时必须填，否则 Emby 收不到改动通知"}})),
+            alert("warning", "改名只影响字幕文件名，不会动视频内容；「删多余同语言」默认关闭，开启后会真实删除多余字幕文件。"),
+        ]
+        return [{"component": "VForm", "content": form}], {
             "enabled": self._enabled, "notify": self._notify, "onlyonce": self._onlyonce,
             "dashboard": self._dashboard, "media_roots": self._media_roots, "scan_cron": self._scan_cron,
             "dry_run": self._dry_run, "auto_apply": self._auto_apply, "limit": self._limit,
             "event_enabled": self._event_enabled,
             "tag_style": self._tag_style, "keep_both": self._keep_both, "default_sub": self._default_sub,
             "prefer_format": self._prefer_format, "content_detect": self._content_detect,
-            "min_chars": self._min_chars,
+            "min_chars": self._min_chars, "max_files": self._max_files,
+            "dedupe_duplicates": self._dedupe_duplicates, "dedupe_keep_default": self._dedupe_keep_default,
             "emby_enabled": self._emby_enabled, "emby_url": self._emby_url, "emby_apikey": self._emby_apikey,
             "emby_refresh_mode": self._emby_refresh_mode,
             "emby_path_map": self._emby_path_map, "emby_touch": self._emby_touch,
@@ -380,6 +329,7 @@ class SubtitleShield(_PluginBase):
         items: List[Dict[str, Any]] = []
         kept: List[Dict[str, Any]] = []
         duplicates: List[Dict[str, Any]] = []
+        removals: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
         for video in videos:
             candidates = list(sub_index.get((video["dir"], video["key"]), []))
@@ -411,7 +361,13 @@ class SubtitleShield(_PluginBase):
                                         "reason": f"已关闭简繁共存，保留 {_LANG_LABELS.get(keep_lang, keep_lang)}"})
                 grouped = {keep_lang: grouped[keep_lang]}
             for lang, group in grouped.items():
-                group.sort(key=lambda x: (_fmt_rank(x["sub"]["ext"], prefer), -x["sub"]["size"]))
+                if self._dedupe_duplicates and self._dedupe_keep_default:
+                    # 先保留会带 .default 的那份（Emby 默认字幕），再比格式、再比体积
+                    group.sort(key=lambda x: (0 if x["default"] else 1,
+                                              _fmt_rank(x["sub"]["ext"], prefer),
+                                              -x["sub"]["size"]))
+                else:
+                    group.sort(key=lambda x: (_fmt_rank(x["sub"]["ext"], prefer), -x["sub"]["size"]))
                 for idx, item in enumerate(group):
                     sub = item["sub"]
                     if lang == "unknown":
@@ -427,10 +383,18 @@ class SubtitleShield(_PluginBase):
                         "target": os.path.basename(item["target"]), "need": need,
                     }
                     if idx > 0:
-                        duplicates.append({**entry, "reason": "同语言重复，未处理"})
+                        reason = "同语言重复，保留格式最优的一份"
+                        if self._dedupe_duplicates:
+                            removals.append({**entry, "reason": reason})
+                        else:
+                            duplicates.append({**entry, "reason": "同语言重复，未处理"})
                         continue
                     if need and os.path.exists(os.path.join(video["dir"], entry["target"])):
-                        duplicates.append({**entry, "reason": "目标文件已存在，按重复处理"})
+                        reason = "目标文件已存在，按重复处理"
+                        if self._dedupe_duplicates:
+                            removals.append({**entry, "reason": "目标已存在，删除多余副本"})
+                        else:
+                            duplicates.append({**entry, "reason": reason})
                         continue
                     if need:
                         items.append(entry)
@@ -438,18 +402,37 @@ class SubtitleShield(_PluginBase):
                         kept.append(entry)
 
         items.sort(key=lambda x: (x["dir"], x["video"]))
+        removals.sort(key=lambda x: (x["dir"], x["video"]))
         summary = {"roots": len(roots), "videos": len(videos), "subtitles": len(subs),
                    "pending": len(items), "kept": len(kept),
-                   "duplicates": len(duplicates), "skipped": len(skipped)}
+                   "duplicates": len(duplicates), "skipped": len(skipped),
+                   "removals": len(removals)}
         return {"timestamp": _now(), "roots": roots, "summary": summary, "items": items,
-                "kept": kept, "duplicates": duplicates, "skipped": skipped, "errors": errors}
+                "kept": kept, "duplicates": duplicates, "skipped": skipped,
+                "removals": removals, "errors": errors}
 
     def apply_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         limit = self._limit
         done: List[Dict[str, Any]] = []
+        removed: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
         already: List[Dict[str, Any]] = []
         touched_dirs = set()
+        # 先删多余的同语言副本（仅在开启「删多余同语言」时计划里才有 removals）
+        for item in plan.get("removals", [])[:limit]:
+            src = os.path.join(item["dir"], item["subtitle"])
+            dst = os.path.join(item["dir"], item["target"])
+            if os.path.abspath(src) == os.path.abspath(dst) or not os.path.isfile(src):
+                continue
+            try:
+                os.remove(src)
+                removed.append({**item, "ok": True})
+                touched_dirs.add(item["dir"])
+                if self._emby_touch:
+                    self.__touch_video(item)
+                logger.info(f"{self.plugin_name}：删除多余字幕 {item['subtitle']}")
+            except Exception as e:
+                failed.append({**item, "reason": str(e)})
         count = 0
         for item in plan.get("items", []):
             if count >= limit:
@@ -479,8 +462,9 @@ class SubtitleShield(_PluginBase):
             except Exception as e:
                 failed.append({**item, "reason": str(e)})
         refresh = self.__refresh_emby(sorted(touched_dirs)) if touched_dirs else None
-        result = {"timestamp": _now(), "applied": len(done), "failed": len(failed),
-                  "already": len(already), "done": done, "errors": failed,
+        result = {"timestamp": _now(), "applied": len(done), "removed": len(removed),
+                  "failed": len(failed), "already": len(already), "done": done,
+                  "removed_items": removed, "errors": failed,
                   "skipped": already, "emby": refresh}
         self.save_data("last_apply", result)
         return result
@@ -620,56 +604,73 @@ class SubtitleShield(_PluginBase):
         plan = self.__plan_data()
         report = self.get_data("last_report") or {}
         apply_result = self.get_data("last_apply") or {}
-        content: List[dict] = []
         summary = plan.get("summary", {})
-        content.append({"component": "VRow", "content": [
-            self.__stat_card("扫描目录", summary.get("roots", 0), "mdi-folder-search"),
-            self.__stat_card("视频", summary.get("videos", 0), "mdi-filmstrip"),
-            self.__stat_card("字幕", summary.get("subtitles", 0), "mdi-subtitles"),
-            self.__stat_card("待规范化", summary.get("pending", 0), "mdi-file-rename"),
-        ]})
-        content.append({"component": "VRow", "content": [
-            self.__stat_card("已合规", summary.get("kept", 0), "mdi-check-decagram"),
-            self.__stat_card("重复字幕", summary.get("duplicates", 0), "mdi-content-duplicate"),
-            self.__stat_card("已处理", apply_result.get("applied", 0), "mdi-check"),
-            self.__stat_card("失败", apply_result.get("failed", 0), "mdi-alert-circle"),
-        ]})
+        content: List[dict] = [
+            {"component": "VRow", "content": [
+                self.__stat_card("扫描目录", summary.get("roots", 0), "mdi-folder-search"),
+                self.__stat_card("视频", summary.get("videos", 0), "mdi-filmstrip"),
+                self.__stat_card("字幕", summary.get("subtitles", 0), "mdi-subtitles"),
+                self.__stat_card("待规范化", summary.get("pending", 0), "mdi-file-rename"),
+            ]},
+            {"component": "VRow", "content": [
+                self.__stat_card("已合规", summary.get("kept", 0), "mdi-check-decagram"),
+                self.__stat_card("同语言重复", summary.get("duplicates", 0), "mdi-content-duplicate"),
+                self.__stat_card("已处理", apply_result.get("applied", 0), "mdi-check"),
+                self.__stat_card("失败", apply_result.get("failed", 0), "mdi-alert-circle"),
+            ]},
+        ]
 
         mode = "只预览（不写入）" if self._dry_run else "会真实改名"
+        extra_mode = " · 删多余同语言：开" if self._dedupe_duplicates else ""
         content.append({"component": "VRow", "content": [
             self.__col(12, {"component": "VAlert", "props": {
-                "type": "info" if self._dry_run else "warning", "variant": "tonal",
+                "type": "info" if self._dry_run else "warning", "variant": "tonal", "class": "mb-4",
                 "text": f"当前模式：{mode} · 标签风格：{'MoviePilot 原生' if self._tag_style == 'mp' else 'chs/cht'} · "
-                        f"简繁共存：{'开' if self._keep_both else '关'} · 上次扫描：{plan.get('timestamp') or '尚未扫描'}"}}),
+                        f"简繁共存：{'开' if self._keep_both else '关'}{extra_mode} · "
+                        f"上次扫描：{plan.get('timestamp') or '尚未扫描'}"}}),
         ]})
 
         rows = [[it["video"], it["subtitle"], it["lang_label"], f"{it['confidence']}（{it['source']}）",
                  it["target"], "改名"] for it in plan.get("items", [])[:50]]
-        content.append(self.__table_card("待规范化清单", ("视频", "当前字幕", "判定", "依据", "目标名", "动作"),
-                                         rows, md=12, caption=f"最多展示 50 条；共 {summary.get('pending', 0)} 条待处理"))
+        content.append(self.__table_card(
+            "待规范化清单", ("视频", "当前字幕", "判定", "依据", "目标名", "动作"), rows,
+            md=12, icon="mdi-file-rename",
+            empty_text="暂无待处理字幕，全部已符合命名规范",
+            caption=f"最多展示 50 条；共 {summary.get('pending', 0)} 条待处理"))
 
         dup_rows = [[it["video"], it["subtitle"], it["lang_label"], it.get("reason", "")]
-                    for it in plan.get("duplicates", [])[:20]]
-        if dup_rows:
-            content.append(self.__table_card("同语言重复（不处理）", ("视频", "字幕", "判定", "说明"),
-                                             dup_rows, md=6, caption="同一语言保留格式最好的一份，其余仅提示"))
+                    for it in (plan.get("removals") or plan.get("duplicates") or [])[:20]]
+        content.append(self.__table_card(
+            "将删除的多余字幕" if self._dedupe_duplicates else "同语言重复（仅提示）",
+            ("视频", "字幕", "判定", "说明"), dup_rows, md=6, icon="mdi-content-duplicate",
+            empty_text="没有同语言重复的字幕",
+            caption=("已开启删除：每轮最多删除「每轮最多处理」条，保留格式最优的一份"
+                     if self._dedupe_duplicates else "同一语言保留格式最好的一份，其余只提示不删除")))
 
         skip_rows = [[it["video"], it["subtitle"], it.get("reason", "")]
                      for it in plan.get("skipped", [])[:20]]
-        if skip_rows:
-            content.append(self.__table_card("已跳过", ("视频", "字幕", "原因"), skip_rows, md=6))
+        content.append(self.__table_card(
+            "已跳过", ("视频", "字幕", "原因"), skip_rows, md=6, icon="mdi-skip-next-circle-outline",
+            empty_text="没有跳过的字幕",
+            caption="语言无法识别时不改名，避免误伤"))
 
         done_rows = [[it["video"], it["subtitle"], it["target"]] for it in apply_result.get("done", [])[:30]]
-        content.append(self.__table_card("最近已处理", ("视频", "原字幕", "新字幕"), done_rows, md=6,
-                                         caption="来自上一次真实写入"))
+        content.append(self.__table_card(
+            "最近已处理", ("视频", "原字幕", "新字幕"), done_rows, md=6, icon="mdi-history",
+            empty_text="还没有执行过真实写入",
+            caption="来自上一次真实写入"))
 
         err_rows = [[it.get("subtitle", ""), it.get("reason", "")] for it in apply_result.get("errors", [])[:20]]
-        content.append(self.__table_card("失败与跳过", ("字幕", "原因"), err_rows, md=6))
+        content.append(self.__table_card(
+            "失败与跳过", ("字幕", "原因"), err_rows, md=6, icon="mdi-alert-circle-outline",
+            empty_text="没有失败项",
+            caption="改名失败或目标冲突时会记录在这里"))
 
         if report.get("errors"):
             content.append({"component": "VRow", "content": [
-                self.__col(12, {"component": "VAlert", "props": {"type": "warning", "variant": "tonal",
-                                                                 "text": "扫描提示：" + "；".join(report["errors"][:6])}})]})
+                self.__col(12, {"component": "VAlert", "props": {
+                    "type": "warning", "variant": "tonal", "class": "mb-4",
+                    "text": "扫描提示：" + "；".join(report["errors"][:6])}})]})
         return content
 
     def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
@@ -697,34 +698,58 @@ class SubtitleShield(_PluginBase):
     @staticmethod
     def __stat_card(title: str, value: Any, icon: str) -> Dict[str, Any]:
         return {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-            {"component": "VCard", "props": {"variant": "tonal", "class": "mb-3"}, "content": [
-                {"component": "VCardText", "content": [
-                    {"component": "VIcon", "props": {"icon": icon, "size": "small"}},
-                    {"component": "div", "props": {"class": "text-h6"}, "text": str(value)},
-                    {"component": "div", "props": {"class": "text-caption"}, "text": title},
+            {"component": "VCard", "props": {"variant": "tonal", "class": "mb-4 h-100"}, "content": [
+                {"component": "VCardText", "props": {"class": "d-flex align-center py-3"}, "content": [
+                    {"component": "VIcon",
+                     "props": {"icon": icon, "size": "large", "class": "me-3 text-medium-emphasis"}},
+                    {"component": "div", "content": [
+                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"}, "text": str(value)},
+                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                         "text": title},
+                    ]},
                 ]},
             ]},
         ]}
 
     @staticmethod
-    def __table_card(title: str, headers: Tuple[str, ...], rows: List[List[Any]],
-                     *, md: int = 6, caption: str = "") -> Dict[str, Any]:
+    def __card_title(title: str, icon: str = "") -> Dict[str, Any]:
+        content: List[dict] = []
+        if icon:
+            content.append({"component": "VIcon",
+                            "props": {"icon": icon, "size": "small", "class": "me-2 text-medium-emphasis"}})
+        content.append({"component": "span", "text": title})
+        return {"component": "VCardTitle",
+                "props": {"class": "d-flex align-center text-subtitle-1 font-weight-medium"},
+                "content": content}
+
+    @classmethod
+    def __table_card(cls, title: str, headers: Tuple[str, ...], rows: List[List[Any]],
+                     *, md: int = 6, caption: str = "", icon: str = "",
+                     empty_text: str = "暂无记录") -> Dict[str, Any]:
         head = {"component": "thead", "content": [
-            {"component": "tr", "content": [{"component": "th", "text": h} for h in headers]}]}
+            {"component": "tr", "content": [
+                {"component": "th", "props": {"class": "text-caption font-weight-medium"}, "text": h}
+                for h in headers]}]}
         body_rows = []
-        for row in rows:
+        if rows:
+            for row in rows:
+                body_rows.append({"component": "tr", "content": [
+                    {"component": "td", "props": {"class": "text-caption"}, "text": str(c)} for c in row]})
+        else:
             body_rows.append({"component": "tr", "content": [
-                {"component": "td", "props": {"class": "text-caption"}, "text": str(c)} for c in row]})
-        body = {"component": "tbody", "content": body_rows}
-        inner: List[dict] = []
-        if title:
-            inner.append({"component": "VCardTitle", "text": title})
-        inner.append({"component": "VCardText", "content": [
-            {"component": "VTable", "props": {"density": "compact", "hover": True}, "content": [head, body]}]})
+                {"component": "td",
+                 "props": {"colspan": len(headers), "class": "text-caption text-medium-emphasis"},
+                 "text": empty_text}]})
+        inner: List[dict] = [cls.__card_title(title, icon)]
+        inner.append({"component": "VCardText", "props": {"class": "pt-0"}, "content": [
+            {"component": "VTable", "props": {"density": "compact", "hover": True},
+             "content": [head, {"component": "tbody", "content": body_rows}]}]})
         if caption:
-            inner.append({"component": "VCardText", "props": {"class": "text-caption"}, "text": caption})
+            inner.append({"component": "VCardText", "props": {"class": "pt-0 text-caption text-medium-emphasis"},
+                          "text": caption})
         return {"component": "VCol", "props": {"cols": 12, "md": md},
-                "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "mb-3"}, "content": inner}]}
+                "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "mb-4 h-100"},
+                             "content": inner}]}
 
     # ------------------------------------------------------------- API
 
