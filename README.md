@@ -7,7 +7,7 @@
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
 | `OpenClashMonitor` | OpenClash 监控 | 0.4.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新；支持页面内嵌 zashboard、一键切换代理组、定时报告推送 Telegram/QQ/企业微信、趋势曲线与异常提醒 |
-| `SubtitleShield` | 字幕规范化 | 0.1.0 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
+| `SubtitleShield` | 字幕规范化 | 0.1.1 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
 
 ---
 
@@ -210,8 +210,9 @@ Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_tr
    的反向代理，面板会空白，请用「在新窗口打开」。
 10. **定时报告依赖宿主的 CronTrigger**：APScheduler 缺失时插件只会在日志里告警并退化为只能手动发报告。
     报告走 MoviePilot 的「插件」消息类型，请确认对应渠道的插件消息开关是打开的。
-
 ---
+
+# 字幕规范化
 
 # 字幕规范化（SubtitleShield）
 
@@ -223,7 +224,8 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 
 | 能力 | 说明 |
 | --- | --- |
-| 内容级简繁判定 | 文件名优先（`zh-cn`/`chi.zh`/`chs`/`gb`/`简` → 简中，`zh-tw`/`cht`/`big5`/`繁` → 繁中，`ja`/`eng` 同理）；文件名没有线索时读字幕正文（UTF-8/UTF-16/GB18030/Big5 自动识别），用简繁字对统计比例判定，并记录判定依据与置信度 |
+| 内容级简繁判定 | 文件名优先（`zh-cn`/`chi.zh`/`chs`/`gb`/`简` → 简中，`zh-tw`/`cht`/`big5`/`繁` → 繁中，`ja`/`eng` 同理）；`zh-Hans`/`zh-Hant` 这类站内抽流标签只当**弱标识**，正文能判出简繁时以正文为准；正文判定会读 UTF-8/UTF-16/GB18030/Big5 编码，用简繁字对统计比例，并记录判定依据与置信度 |
+| 不误伤未知语种 | 语言确实识别不出来时**不改名**，只在「已跳过」里提示，避免把仅有的一点标签信息改丢 |
 | 与视频同名 | 目标名严格用「视频去扩展名 + 语言标签 + 原扩展名」，例：`Show S01E01 1080p.WEB-DL.default.chi.zh-cn.ass` |
 | 跨主干名配对 | 字幕与视频的主干名不一致（例如视频 `1080p.BluRay.AVC`、字幕 `1080p.BluRay.x265`）也能配对：优先用 `SxxExx` / `1x02` 归一，其次才用「标题+年份」 |
 | 简繁共存 | 默认两份都保留（`.chi.zh-cn` + `.zh-tw`），可关闭只留默认语言 |
@@ -233,7 +235,7 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 | 定时与试跑 | `dry_run` 默认开启（只出计划不改文件），`limit` 默认 10 条，可先用少量样本验证 |
 | 历史库批量 | 扫描媒体库目录（不是下载目录），把历史遗留的不规范字幕一起统一 |
 
-命名风格可切换：`tag_style=mp`（默认，`chi.zh-cn`/`zh-tw`，与 MoviePilot 一致）、`tag_style=chs`（`chs`/`cht`）。
+命名风格可切换：`tag_style=mp`（默认，`chi.zh-cn`/`zh-tw`，与 MoviePilot 一致）、`tag_style=chs_cht`（`chs`/`cht`）。
 
 ## 安装
 
