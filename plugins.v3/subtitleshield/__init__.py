@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.5"
+    plugin_version = "0.1.6"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -448,6 +448,7 @@ class SubtitleShield(_PluginBase):
         limit = self._limit
         done: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
+        already: List[Dict[str, Any]] = []
         touched_dirs = set()
         count = 0
         for item in plan.get("items", []):
@@ -456,7 +457,11 @@ class SubtitleShield(_PluginBase):
             src = os.path.join(item["dir"], item["subtitle"])
             dst = os.path.join(item["dir"], item["target"])
             if not os.path.isfile(src):
-                failed.append({**item, "reason": "源文件不存在"})
+                if os.path.exists(dst):
+                    # 上一轮已经改过名，源文件自然已经不在，按「已规范化」处理
+                    already.append({**item, "reason": "已规范化"})
+                else:
+                    failed.append({**item, "reason": "源文件不存在"})
                 continue
             if os.path.abspath(src) == os.path.abspath(dst):
                 continue
@@ -475,7 +480,8 @@ class SubtitleShield(_PluginBase):
                 failed.append({**item, "reason": str(e)})
         refresh = self.__refresh_emby(sorted(touched_dirs)) if touched_dirs else None
         result = {"timestamp": _now(), "applied": len(done), "failed": len(failed),
-                  "done": done, "errors": failed, "emby": refresh}
+                  "already": len(already), "done": done, "errors": failed,
+                  "skipped": already, "emby": refresh}
         self.save_data("last_apply", result)
         return result
 
@@ -754,7 +760,8 @@ class SubtitleShield(_PluginBase):
         payload = payload or {}
         if payload.get("limit"):
             self._limit = max(1, min(_safe_int(payload.get("limit"), self._limit), 500))
-        plan = self.get_data("last_plan") or self.build_plan()
+        plan = self.build_plan()
+        self.save_data("last_plan", plan)
         if self._dry_run and not payload.get("confirm"):
             return {"ok": False, "message": "当前处于只预览模式，请先关闭 dry_run 或传 confirm=true", "plan": plan.get("summary")}
         result = self.apply_plan(plan)
@@ -930,7 +937,8 @@ class SubtitleShield(_PluginBase):
         if name == "apply":
             if arg:
                 self._limit = max(1, min(_safe_int(arg, self._limit), 500))
-            plan = self.get_data("last_plan") or self.build_plan()
+            plan = self.build_plan()
+            self.save_data("last_plan", plan)
             if self._dry_run:
                 self.__message("字幕规范化未执行", "当前是只预览模式，请先在插件设置里关闭「只预览不写入」。")
                 return
