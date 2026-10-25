@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.3"
+    plugin_version = "0.1.4"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -100,6 +100,7 @@ class SubtitleShield(_PluginBase):
     _scan_cron = "0 4 * * *"
     _dry_run = True
     _auto_apply = False
+    _event_enabled = True
     _limit = 10
     _tag_style = "mp"
     _keep_both = True
@@ -127,6 +128,7 @@ class SubtitleShield(_PluginBase):
         self._scan_cron = str(config.get("scan_cron") or "0 4 * * *").strip() or "0 4 * * *"
         self._dry_run = bool(config.get("dry_run", True))
         self._auto_apply = bool(config.get("auto_apply", False))
+        self._event_enabled = bool(config.get("event_enabled", True))
         self._limit = max(1, min(_safe_int(config.get("limit"), 10), 500))
         self._tag_style = str(config.get("tag_style") or "mp")
         self._keep_both = bool(config.get("keep_both", True))
@@ -245,9 +247,9 @@ class SubtitleShield(_PluginBase):
                                                                                 "hint": "匹配时加 .default 前缀，如 zh-cn"}}),
                             self.__col(3, {"component": "VTextField", "props": {"modelValue": self._prefer_format, "label": "格式优先级",
                                                                                 "hint": "ass,srt,ssa,vtt,sup"}}),
-                            self.__col(2, {"component": "VSwitch", "props": {"modelValue": self._auto_apply, "label": "自动执行",
+                            self.__col(2, {"component": "VSwitch", "props": {"modelValue": self._event_enabled, "label": "下载完成即处理",
                                                                              "density": "compact",
-                                                                             "hint": "定时任务是否直接改名（建议先关）"}}),
+                                                                             "hint": "整理完成后立刻规范化该目录并刷新 Emby"}}),
                             self.__col(2, {"component": "VTextField", "props": {"modelValue": self._min_chars, "label": "最少字符",
                                                                                 "type": "number"}}),
                             self.__col(2, {"component": "VTextField", "props": {"modelValue": self._timeout, "label": "超时(秒)",
@@ -302,6 +304,7 @@ class SubtitleShield(_PluginBase):
             "enabled": self._enabled, "notify": self._notify, "onlyonce": self._onlyonce,
             "dashboard": self._dashboard, "media_roots": self._media_roots, "scan_cron": self._scan_cron,
             "dry_run": self._dry_run, "auto_apply": self._auto_apply, "limit": self._limit,
+            "event_enabled": self._event_enabled,
             "tag_style": self._tag_style, "keep_both": self._keep_both, "default_sub": self._default_sub,
             "prefer_format": self._prefer_format, "content_detect": self._content_detect,
             "min_chars": self._min_chars,
@@ -332,8 +335,8 @@ class SubtitleShield(_PluginBase):
             self.__notify_report(report)
         return result
 
-    def build_plan(self) -> Dict[str, Any]:
-        roots = self.__roots()
+    def build_plan(self, roots: Optional[List[str]] = None) -> Dict[str, Any]:
+        roots = [r for r in (roots or []) if r] or self.__roots()
         errors: List[str] = []
         if not roots:
             return {"timestamp": _now(), "roots": [], "summary": {"roots": 0, "videos": 0, "subtitles": 0,
@@ -798,6 +801,85 @@ class SubtitleShield(_PluginBase):
         logger.info(f"{self.plugin_name}：已刷新 Emby，目录 {len(dirs)} 个，时间戳更新 {touched} 个")
         return out
 
+    # ------------------------------------------------------- 下载完成事件
+
+    def normalize_dirs(self, dirs: List[str], apply: Optional[bool] = None) -> Dict[str, Any]:
+        """只对指定目录做一次规范化，供「整理完成」事件使用。"""
+        allowed = self.__roots()
+        picked: List[str] = []
+        for d in dirs or []:
+            if not d:
+                continue
+            real = os.path.abspath(d)
+            if not os.path.isdir(real):
+                continue
+            if any(real == r or real.startswith(r + os.sep) for r in allowed):
+                picked.append(real)
+            else:
+                logger.debug(f"{self.plugin_name}：目录不在媒体库范围内，跳过 {real}")
+        picked = sorted(set(picked))
+        if not picked:
+            return {"ok": False, "message": "目录不在媒体库范围内", "dirs": []}
+        plan = self.build_plan(picked)
+        should_apply = (not self._dry_run and self._auto_apply) if apply is None else bool(apply)
+        result = self.apply_plan(plan) if should_apply and plan.get("items") else None
+        self.save_data("last_event_plan", {"timestamp": _now(), "dirs": picked,
+                                           "summary": plan.get("summary", {}),
+                                           "items": plan.get("items", []),
+                                           "apply": result, "errors": plan.get("errors", [])})
+        if result and self._notify:
+            self.__message("字幕规范化（下载完成）",
+                           f"目录 {len(picked)} 个，改名 {result.get('applied', 0)} 条")
+        return {"ok": True, "dirs": picked, "summary": plan.get("summary", {}),
+                "applied": (result or {}).get("applied", 0), "emby": (result or {}).get("emby"),
+                "dry_run": self._dry_run}
+
+    @staticmethod
+    def __event_dirs(event: Any) -> List[str]:
+        """从事件数据里捞出所有绝对路径，再折算成目录。"""
+        found: List[str] = []
+
+        def walk(node: Any, depth: int = 0) -> None:
+            if depth > 6:
+                return
+            if isinstance(node, str):
+                text = node.strip()
+                if not text or len(text) > 4096:
+                    return
+                if os.path.isabs(text):
+                    found.append(text)
+                return
+            if isinstance(node, dict):
+                for value in node.values():
+                    walk(value, depth + 1)
+                return
+            if isinstance(node, (list, tuple, set)):
+                for value in node:
+                    walk(value, depth + 1)
+
+        walk(getattr(event, "event_data", None) or {})
+        dirs: List[str] = []
+        for path in found:
+            if os.path.isdir(path):
+                dirs.append(path)
+            elif os.path.isfile(path) or os.path.splitext(path)[1]:
+                dirs.append(os.path.dirname(path))
+        return sorted(set(dirs))
+
+    def handle_transfer_event(self, event: Any) -> None:
+        """整理完成 / 字幕落盘完成：只处理事件涉及的目录。"""
+        if not self._enabled or not self._event_enabled:
+            return
+        try:
+            dirs = self.__event_dirs(event)
+            if not dirs:
+                logger.debug(f"{self.plugin_name}：整理完成事件里没有可用目录")
+                return
+            result = self.normalize_dirs(dirs)
+            logger.info(f"{self.plugin_name}：整理完成事件处理结果 {result}")
+        except Exception as e:
+            logger.error(f"{self.plugin_name}：处理整理完成事件失败 {e}")
+
     # ------------------------------------------------------------- 命令
 
     @staticmethod
@@ -1153,3 +1235,23 @@ def _http_json(method: str, url: str, *, headers: Optional[Dict[str, str]] = Non
     except Exception as e:
         out["error"] = str(e)
     return out
+
+
+# --------------------------------------------------------------- 事件注册
+def _register_event_handlers() -> None:
+    """把「整理完成」「字幕整理完成」两个事件接到插件上。"""
+    if eventmanager is None or EventType is None:
+        return
+    for event_name in ("TransferComplete", "SubtitleTransferComplete"):
+        event_type = getattr(EventType, event_name, None)
+        if event_type is None:
+            continue
+        try:
+            eventmanager.register(event_type)(SubtitleShield.handle_transfer_event)
+            logger.debug(f"字幕规范化：已注册事件 {event_name}")
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"字幕规范化：注册事件 {event_name} 失败 {e}")
+
+
+_register_event_handlers()
+
