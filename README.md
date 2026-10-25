@@ -123,6 +123,11 @@ Telegram / 微信命令：`/openclash` 返回一段运行状态摘要。
    老版本只有 `cpu_ticks` 时退化为两次采样求差。LocalDNS 的 CPU 也是两次采样 `/metrics` 求差。
 4. **主动 DNS 探测使用 UDP/53**：如果上游只支持 DoH/DoT，请把 `tls://`、`https://` 形式的地址留给 LocalDNS / AdGuard，
    不要放进主动探测列表。
+5. **新版 Mihomo 的 `/configs` 可能不再带 `dns` 段**（如 `alpha-gbc76c13`）：此时 `enhanced-mode`、上游 `nameserver`、
+   fake-ip 段都取不到，插件改为按 LuCI `run_mode`（`fake-ip` / `redir-host`）推断 DNS 模式，上游列表请以 LocalDNS 面板为准。
+6. **订阅信息接口较慢**：`sub_info_get` 会现场请求机场的订阅链接，插件给它 3 倍超时（至少 20s），
+   首轮采集可能比其他分区慢几秒。
+
 
 ## 许可
 
