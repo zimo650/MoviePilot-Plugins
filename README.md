@@ -7,7 +7,7 @@
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
 | `OpenClashMonitor` | OpenClash 监控 | 0.4.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新；支持页面内嵌 zashboard、一键切换代理组、定时报告推送 Telegram/QQ/企业微信、趋势曲线与异常提醒 |
-| `SubtitleShield` | 字幕规范化 | 0.1.2 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
+| `SubtitleShield` | 字幕规范化 | 0.1.3 | 统一媒体库外挂字幕命名：文件名优先、正文兜底判断简繁，重命名成与视频同名并带 `chi.zh-cn`/`zh-tw` 标签，支持简繁共存、同语言去重提示、历史库批量规范化与 Emby 条目/库刷新 |
 
 ---
 
@@ -272,6 +272,7 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 | `/subtitleguard` | 查看上次扫描摘要 |
 | `/subtitleguard_scan [n]` | 生成计划（只读，不改文件），可选覆盖条数 |
 | `/subtitleguard_apply [n]` | 按计划真正改名；`dry_run` 未关闭时会拒绝并提示 |
+| `/subtitleguard_refresh` | 把已规范化的条目重新推给 Emby（更新视频时间戳 + 通知目录改动），用于历史改名后 Emby 仍显示旧语言 |
 
 ## REST API
 
@@ -282,6 +283,7 @@ MoviePilot 自己只在整理时按**文件名**识别语种（`transhandler.py`
 | GET | `/status` | bear | 最近一次扫描摘要与配置状态 |
 | POST | `/scan` | bear | 生成计划（body 可带 `limit`） |
 | POST | `/apply` | bear | 执行计划；`dry_run` 未关闭时需 body 带 `confirm: true` |
+| POST | `/refresh_emby` | bear | 把已规范化的目录重新推给 Emby；body 可带 `touch: false` 只通知不改时间戳 |
 | GET | `/report` | apikey | 生成文本报告（便于脚本或通知使用） |
 
 ## 页面
