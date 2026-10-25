@@ -67,7 +67,7 @@ except Exception:  # noqa: BLE001
 # 常量
 # ---------------------------------------------------------------------------
 
-_UA = "MoviePilot-OpenClashMonitor/0.4.0"
+_UA = "MoviePilot-OpenClashMonitor/0.5.0"
 _SNAPSHOT_KEY = "snapshot"
 _NOTIFY_KEY = "notified_versions"
 _ALERT_KEY = "alert_state"
@@ -248,6 +248,18 @@ def _dns_mode_from_run_mode(run_mode: str) -> str:
     if "redir-host" in text or "redir_host" in text:
         return "redir-host"
     return ""
+
+
+def _json_or_none(value: Any) -> Any:
+    """把可能是字符串的响应体解析成 JSON；解析不了就返回 None。"""
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
 
 
 def _clean_loading(value: Any) -> str:
@@ -634,7 +646,7 @@ class OpenClashMonitor(_PluginBase):
         "插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.4.0"
+    plugin_version = "0.5.0"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "openclashmonitor_"
@@ -1933,6 +1945,8 @@ class OpenClashMonitor(_PluginBase):
             "dns_current": dns_current,
             "dns_latest": dns_latest,
             "dns_update": bool(dns_view.get("update_available")) or _differs(dns_latest, dns_current),
+            "dns_source": str(dns_view.get("latest_source") or ""),
+            "dns_error": str(dns_view.get("remote_error") or ""),
             "release_branch": str(update.get("release_branch") or ""),
             "core_type_choice": str(update.get("corever") or ""),
         }
@@ -2182,8 +2196,9 @@ class OpenClashMonitor(_PluginBase):
         view["built_at"] = str(ui.get("builtAt") or "")
 
         if self._ld_github:
-            latest = self.__ld_github_latest()
+            latest, cues = self.__ld_remote_version()
             if latest:
+                view["latest_source"] = str(latest.get("source") or "")
                 view["latest_version"] = str(latest.get("ui_version") or "")
                 view["latest_tag"] = str(latest.get("tag") or "")
                 view["latest_core"] = str(latest.get("core") or "")
@@ -2195,6 +2210,9 @@ class OpenClashMonitor(_PluginBase):
                 remote_core = str(view.get("latest_core") or "").upper()
                 if local_core and remote_core and local_core != remote_core:
                     view["core_channel_mismatch"] = True
+            else:
+                view["remote_error"] = "；".join(cues)[:240]
+                errors.append(f"LocalDNS 远端版本查询失败：{view['remote_error']}")
 
         return view, errors
 
@@ -2277,29 +2295,67 @@ class OpenClashMonitor(_PluginBase):
         return values
 
     def __ld_github_latest(self) -> Optional[Dict[str, Any]]:
-        """查 GitHub releases，拿到 LocalDNS 的最新版本。"""
-        url = "https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest"
+        """兼容旧接口：只返回远端最新版本文档。"""
+        latest, _cues = self.__ld_remote_version()
+        return latest or None
+
+    def __ld_remote_version(self) -> Tuple[Dict[str, Any], List[str]]:
+        """多源探测 LocalDNS 最新版本：GitHub Releases API → raw VERSION.json → jsDelivr。
+
+        国内网络常常访问不了 api.github.com，所以必须有多条回退路径，
+        否则页面上的「最新版本」会一直是空的（状态显示「未知」）。
+        """
+        cues: List[str] = []
+        timeout = max(self._timeout, 12)
+        api_url = "https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest"
         result = http_request(
-            "GET", url,
+            "GET", api_url,
             headers={"Accept": "application/vnd.github+json", "User-Agent": _UA},
-            timeout=max(self._timeout, 12),
+            timeout=timeout,
         )
-        doc = result.get("data") if result["status"] == 200 else None
-        if not isinstance(doc, dict):
-            return None
-        tag = str(doc.get("tag_name") or "").strip()
-        if not tag:
-            return None
-        core, ui_version = "", tag.lstrip("vV")
-        match = re.match(r"^([a-z0-9]+)-ui-v(.+)$", tag, re.IGNORECASE)
-        if match:
-            core, ui_version = match.group(1), match.group(2)
-        return {
+        doc = _json_or_none(result.get("data")) or _json_or_none(result.get("text"))
+        tag = str(doc.get("tag_name") or "").strip() if isinstance(doc, dict) else ""
+        if tag:
+            return self.__parse_ld_tag(tag, str(doc.get("published_at") or ""), "github-api"), cues
+        cues.append(f"GitHub API 失败（{result.get('error') or 'HTTP ' + str(result.get('status'))}）")
+        for source, url in (
+            ("raw", "https://raw.githubusercontent.com/yyhoworks/LocalDNS/main/VERSION.json"),
+            ("jsdelivr", "https://cdn.jsdelivr.net/gh/yyhoworks/LocalDNS@main/VERSION.json"),
+        ):
+            res = http_request(
+                "GET", url,
+                headers={"Accept": "application/json", "User-Agent": _UA},
+                timeout=timeout,
+            )
+            body = _json_or_none(res.get("data")) or _json_or_none(res.get("text"))
+            if res.get("status") == 200 and isinstance(body, dict):
+                ui = str(body.get("uiVersion") or "").strip()
+                core = str(body.get("backendVersion") or "").strip()
+                tag = str(body.get("releaseTag") or "").strip()
+                if ui or tag:
+                    info = self.__parse_ld_tag(tag or f"{core.lower()}-ui-v{ui}",
+                                               str(body.get("builtAt") or ""), source)
+                    info["ui_version"] = info.get("ui_version") or ui
+                    info["core"] = info.get("core") or core
+                    return info, cues
+            cues.append(f"{source} 失败（{res.get('error') or 'HTTP ' + str(res.get('status'))}）")
+        return {}, cues
+
+    @staticmethod
+    def __parse_ld_tag(tag: str, published: str, source: str) -> Dict[str, Any]:
+        """从 LocalDNS 的 tag（形如 fjgoe-ui-v2026.10.23.3）解析核心代号与 UI 版本。"""
+        info: Dict[str, Any] = {
             "tag": tag,
-            "core": core,
-            "ui_version": ui_version,
-            "published_at": str(doc.get("published_at") or ""),
+            "core": "",
+            "ui_version": str(tag or "").lstrip("vV"),
+            "published_at": published,
+            "source": source,
         }
+        match = re.match(r"^([A-Za-z0-9]+)-ui-v(.+)$", str(tag or ""))
+        if match:
+            info["core"] = match.group(1)
+            info["ui_version"] = match.group(2)
+        return info
 
     @staticmethod
     def __ld_querylog(raw: Any, limit: int) -> List[Dict[str, Any]]:
@@ -2976,33 +3032,47 @@ class OpenClashMonitor(_PluginBase):
                      "props": {"type": "info", "variant": "tonal",
                                "text": "首次采集进行中，请等待几秒后刷新本页。"}}]
 
+        def row_of(*cards: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            """把若干张卡片包进同一个 VRow（宽度与统计卡一致）。"""
+            picked = [card for card in cards if card]
+            if not picked:
+                return None
+            return {"component": "VRow", "content": picked}
+
         content: List[dict] = [self.__status_alert(snapshot), self.__overview_row(snapshot)]
-        alerts_card = self.__alerts_card(snapshot)
-        if alerts_card:
-            content.append(alerts_card)
-        switch_card = self.__group_switch_card(snapshot)
-        if switch_card:
-            content.append(switch_card)
-        zashboard_card = self.__zashboard_card()
-        if zashboard_card:
-            content.append(zashboard_card)
-        trend_card = self.__trend_card(snapshot)
-        if trend_card:
-            content.append(trend_card)
+        for single in (self.__alerts_card(snapshot),
+                       self.__group_switch_card(snapshot),
+                       self.__zashboard_card(),
+                       self.__trend_card(snapshot)):
+            row = row_of(single)
+            if row:
+                content.append(row)
+
+        # 版本与订阅内容少，两两合并成一行；只剩一个时占满整行
+        small = [card for card in (self.__version_card(snapshot),
+                                   self.__subscription_card(snapshot)) if card]
+        if len(small) == 2:
+            for card in small:
+                card.setdefault("props", {})["md"] = 6
+        elif small:
+            small[0].setdefault("props", {})["md"] = 12
+        small_row = row_of(*small)
+        if small_row:
+            content.append(small_row)
+
         for card in (
-            self.__version_card(snapshot),
             self.__node_group_card(snapshot),
             self.__node_card(snapshot),
-            self.__subscription_card(snapshot),
             self.__dns_card(snapshot),
             self.__probe_card(snapshot),
             self.__querylog_card(snapshot),
             self.__report_card(),
+            self.__actions_card(),
         ):
-            if card:
-                content.append(card)
-        content.append(self.__actions_card())
-        return content
+            row = row_of(card)
+            if row:
+                content.append(row)
+        return self.__polish_tables(content)
 
     def __status_alert(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """采集状态提示条。"""
@@ -3215,7 +3285,8 @@ class OpenClashMonitor(_PluginBase):
             "-H \"Content-Type: application/json\" -d '{\"action\":\"rule\",\"value\":\"global\"}'。"
             + ("" if self._actions_enabled else "当前已在配置中关闭一键操作。")
         )
-        return self.__table_card("一键操作", rows, cols=12, md=12, caption=caption)
+        return self.__table_card("一键操作", rows, cols=12, md=12, caption=caption,
+                                 widths=("18%", "34%", "48%"))
 
     def __zashboard_card(self) -> Optional[Dict[str, Any]]:
         """内嵌 zashboard 面板，可直接在里面选代理组。"""
@@ -3383,7 +3454,8 @@ class OpenClashMonitor(_PluginBase):
         ]
         caption = ("定时报告由 MoviePilot 的调度器按 cron 触发，内容含状态、节点、订阅、版本、"
                    "LocalDNS 上游健康与当前告警；渠道留空时交给 MoviePilot 的默认通知路由。")
-        return self.__table_card("通知报告", body, cols=12, md=12, caption=caption, extra=extra)
+        return self.__table_card("通知报告", body, cols=12, md=12, caption=caption, extra=extra,
+                                 widths=("26%", "74%"))
 
     def __version_card(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """版本与更新对比卡片。"""
@@ -3421,9 +3493,18 @@ class OpenClashMonitor(_PluginBase):
                      status_cell,
                  ]}
             )
-        return self.__table_card("版本与更新", body, cols=12, md=5,
-                                 caption="插件与内核的最新版本来自 OpenClash 的 last_version 接口，"
-                                         "首次拉取可能显示为空；LocalDNS 的最新版取自 GitHub releases。")
+        source_text = {"github-api": "GitHub Releases API",
+                       "raw": "GitHub raw VERSION.json",
+                       "jsdelivr": "jsDelivr CDN"}.get(str(versions.get("dns_source") or ""), "")
+        caption = ("插件与内核的最新版本来自 OpenClash 的 last_version 接口，首次拉取可能显示为空；"
+                   "LocalDNS 的最新版依次尝试 GitHub Releases API、raw VERSION.json 与 jsDelivr，"
+                   f"当前来源：{source_text or '尚未取到'}。")
+        dns_error = str(versions.get("dns_error") or "")
+        if dns_error:
+            caption += f" 上次查询失败：{dns_error}"
+        return self.__table_card("版本与更新", body, cols=12, md=6,
+                                 widths=("32%", "24%", "24%", "20%"),
+                                 caption=caption)
 
     def __node_group_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """代理组卡片。"""
@@ -3458,7 +3539,8 @@ class OpenClashMonitor(_PluginBase):
         caption = (f"共 {_safe_int(nodes.get('total'), 0)} 个节点，在线 {_safe_int(nodes.get('alive'), 0)} 个"
                    f"，平均延迟 {nodes.get('avg_delay') or '-'} ms。"
                    "延迟来自内核最近一次测速，未测速的节点显示为未知。")
-        return self.__table_card("代理组", body, cols=12, md=7, caption=caption)
+        return self.__table_card("代理组", body, cols=12, md=12, caption=caption,
+                                 widths=("30%", "16%", "30%", "12%", "12%"))
 
     def __node_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """节点延迟卡片。"""
@@ -3506,7 +3588,8 @@ class OpenClashMonitor(_PluginBase):
         sources = nodes.get("sources") or []
         if sources:
             caption += " 节点来源：" + "、".join(str(s) for s in sources[:6])
-        return self.__table_card("节点延迟", body, cols=12, md=7, caption=caption)
+        return self.__table_card("节点延迟", body, cols=12, md=12, caption=caption,
+                                 widths=("38%", "16%", "14%", "14%", "18%"))
 
     def __subscription_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """订阅卡片。"""
@@ -3543,7 +3626,8 @@ class OpenClashMonitor(_PluginBase):
             )
         caption = (f"当前配置：{sub.get('current') or '未知'}。剩余流量与到期时间来自订阅服务商，"
                    "部分机场不提供（显示「不支持查询」）。")
-        return self.__table_card("订阅信息", body, cols=12, md=7, caption=caption)
+        return self.__table_card("订阅信息", body, cols=12, md=6, caption=caption,
+                                 widths=("22%", "10%", "14%", "14%", "14%", "14%", "12%"))
 
     def __dns_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """LocalDNS 概览卡片。"""
@@ -3721,7 +3805,8 @@ class OpenClashMonitor(_PluginBase):
                        "若 AdGuard 未返回，可参考下方「主动探测」面板。")
         else:
             caption = "未启用 DNS 接口采集，仅展示 Clash 内置 DNS 与主动探测结果。"
-        return self.__table_card("LocalDNS 状态", rows, cols=12, md=6, caption=caption,
+        return self.__table_card("LocalDNS 状态", rows, cols=12, md=12, caption=caption,
+                                 widths=("24%", "76%"),
                                  extra=up_content)
 
     def __probe_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3755,7 +3840,8 @@ class OpenClashMonitor(_PluginBase):
             )
         caption = (f"由本机直接向各上游 DNS 发 UDP 查询（域名 {self._dns_probe_domain}），"
                    "不依赖任何管理接口；若宿主容器禁止 UDP 出站，这里会全部超时。")
-        return self.__table_card("主动 DNS 探测", body, cols=12, md=6, caption=caption)
+        return self.__table_card("主动 DNS 探测", body, cols=12, md=12, caption=caption,
+                                 widths=("26%", "14%", "14%", "46%"))
 
     def __querylog_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """查询日志卡片。"""
@@ -3796,17 +3882,57 @@ class OpenClashMonitor(_PluginBase):
         provider_text = {"localdns": "LocalDNS", "adguard": "AdGuard Home"}.get(
             str(dns.get("provider") or ""), "DNS 服务")
         return self.__table_card("最近 DNS 查询", body, cols=12, md=12,
+                                 widths=("13%", "29%", "8%", "13%", "10%", "10%", "17%"),
                                  caption=f"来自 {provider_text} 的查询日志，按时间倒序；"
                                          "「拦截」依据 LocalDNS 的 domain_set 归类（adguard/blocked 系列）。")
 
     @staticmethod
+    def __polish_tables(node: Any) -> Any:
+        """把页面里所有表格统一成「可折行 + 固定布局」，避免长文本撑出横向滚动条。"""
+        cell_style = "white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+        if isinstance(node, dict):
+            comp = node.get("component")
+            if comp in ("VTable", "th", "td"):
+                props = node.setdefault("props", {})
+                style = str(props.get("style") or "")
+                if comp == "VTable" and "table-layout" not in style:
+                    props["style"] = f"{style} table-layout: fixed; width: 100%;".strip()
+                elif comp in ("th", "td") and "white-space" not in style:
+                    props["style"] = f"{style} {cell_style}".strip()
+            for child in node.get("content") or []:
+                OpenClashMonitor.__polish_tables(child)
+        elif isinstance(node, list):
+            for child in node:
+                OpenClashMonitor.__polish_tables(child)
+        return node
+
+    @staticmethod
     def __table_card(title: str, body: List[Dict[str, Any]], *,
-                     cols: int = 12, md: int = 6, caption: Optional[str] = None,
-                     extra: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        """构造带表格的卡片。"""
+                     cols: int = 12, md: int = 12, caption: Optional[str] = None,
+                     extra: Optional[List[Dict[str, Any]]] = None,
+                     widths: Optional[Tuple[str, ...]] = None) -> Dict[str, Any]:
+        """构造带表格的卡片（单元格允许换行、按百分比分列，不出横向滚动条）。"""
+        cell_style = "white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+        columns = 0
+        for section in body:
+            for row in (section.get("content") or []):
+                cells = row.get("content") or []
+                if row.get("component") == "tr":
+                    columns = max(columns, len(cells))
+                for idx, cell in enumerate(cells):
+                    props = cell.setdefault("props", {})
+                    style = str(props.get("style") or "")
+                    if cell_style not in style:
+                        style = (style + " " + cell_style).strip()
+                    if widths and cell.get("component") == "th" and idx < len(widths):
+                        style = f"{style} width: {widths[idx]}".strip()
+                    props["style"] = style
         content: List[Dict[str, Any]] = [
             {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": title},
-            {"component": "VTable", "props": {"density": "compact", "hover": True}, "content": body},
+            {"component": "VTable",
+             "props": {"density": "compact", "hover": True,
+                       "style": "table-layout: fixed; width: 100%;"},
+             "content": body},
         ]
         if caption:
             content.append({"component": "div",
