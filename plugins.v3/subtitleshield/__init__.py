@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.3"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -643,7 +643,7 @@ class SubtitleShield(_PluginBase):
                     for it in (plan.get("removals") or plan.get("duplicates") or [])[:20]]
         cards.append(self.__table_card(
             "将删除的多余字幕" if self._dedupe_duplicates else "同语言重复（仅提示）",
-            ("视频", "字幕", "判定", "说明"), dup_rows, md=6, icon="mdi-content-duplicate",
+            ("视频", "字幕", "判定", "说明"), dup_rows, md=12, icon="mdi-content-duplicate",
             empty_text="没有同语言重复的字幕",
             widths=("26%", "28%", "8%", "38%"),
             caption=("已开启删除：每轮最多删除「每轮最多处理」条，保留格式最优的一份"
@@ -652,21 +652,21 @@ class SubtitleShield(_PluginBase):
         skip_rows = [[it["video"], it["subtitle"], it.get("reason", "")]
                      for it in plan.get("skipped", [])[:20]]
         cards.append(self.__table_card(
-            "已跳过", ("视频", "字幕", "原因"), skip_rows, md=6, icon="mdi-skip-next-circle-outline",
+            "已跳过", ("视频", "字幕", "原因"), skip_rows, md=12, icon="mdi-skip-next-circle-outline",
             empty_text="没有跳过的字幕",
             widths=("28%", "28%", "44%"),
             caption="语言无法识别时不改名，避免误伤"))
 
         done_rows = [[it["video"], it["subtitle"], it["target"]] for it in apply_result.get("done", [])[:30]]
         cards.append(self.__table_card(
-            "最近已处理", ("视频", "原字幕", "新字幕"), done_rows, md=6, icon="mdi-history",
+            "最近已处理", ("视频", "原字幕", "新字幕"), done_rows, md=12, icon="mdi-history",
             empty_text="还没有执行过真实写入",
             widths=("30%", "30%", "40%"),
             caption="来自上一次真实写入"))
 
         err_rows = [[it.get("subtitle", ""), it.get("reason", "")] for it in apply_result.get("errors", [])[:20]]
         cards.append(self.__table_card(
-            "失败与跳过", ("字幕", "原因"), err_rows, md=6, icon="mdi-alert-circle-outline",
+            "失败与跳过", ("字幕", "原因"), err_rows, md=12, icon="mdi-alert-circle-outline",
             empty_text="没有失败项",
             widths=("34%", "66%"),
             caption="改名失败或目标冲突时会记录在这里"))
