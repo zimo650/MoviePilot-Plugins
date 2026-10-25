@@ -12,7 +12,7 @@
     python devtools/update_mp.py --expect 0.2.0
     python devtools/update_mp.py --plugin SubtitleShield \
         --repo https://github.com/zimo650/MoviePilot-Plugins --expect 0.2.0 \
-        --base http://10.10.10.3:3010 --apikey <你的 API 密钥>
+        --base http://<MoviePilot地址>:3001 --apikey <你的 API 密钥>
 
 只依赖标准库。
 """
@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_BASE = os.environ.get("MP_BASE", "http://10.10.10.3:3010")
+DEFAULT_BASE = os.environ.get("MP_BASE", "http://127.0.0.1:3001")
 DEFAULT_KEY = os.environ.get("MP_APIKEY", "")
 DEFAULT_PLUGIN = "SubtitleShield"
 DEFAULT_REPO = "https://github.com/zimo650/MoviePilot-Plugins"
