@@ -16,5 +16,19 @@
       "v0.2.0": "适配真实 iStoreOS + OpenClash v0.48 + Mihomo + LocalDNS：新增 LocalDNS 采集（状态/上游健康/查询日志/版本）、provider 节点合并、LuCI 登录携带 Referer、CPU 改为读取 toolbar 的 cpu 字段",
       "v0.1.0": "初始版本：OpenClash 运行状态、节点延迟、订阅流量、版本更新、LocalDNS 与上游 DNS 健康监控"
     }
+  },
+  "SubtitleShield": {
+    "name": "字幕规范化",
+    "description": "统一媒体库外挂字幕的命名：文件名优先、字幕正文兜底判断简体/繁体，重命名成与视频同名并带语言标签（chi.zh-cn / zh-tw，可切换 chs/cht）；支持简繁共存、同语言去重提示、历史库批量规范化，并按条目或库刷新 Emby。",
+    "labels": "工具,字幕",
+    "version": "0.1.0",
+    "icon": "Moviepilot_A.png",
+    "author": "zimo650",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v0.1.0": "初始版本：扫描媒体库字幕，文件名优先 + 正文兜底判定简繁，按 MoviePilot 原生风格重命名（chi.zh-cn / zh-tw，默认语言加 .default），支持简繁共存、同语言去重提示、dry_run 试跑与 limit 限流、Emby 条目/库刷新"
+    }
   }
 }
