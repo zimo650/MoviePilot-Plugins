@@ -6,13 +6,13 @@
 
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
-| `OpenClashMonitor` | OpenClash 监控 | 0.3.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新，并支持一键操作、趋势曲线与异常提醒 |
+| `OpenClashMonitor` | OpenClash 监控 | 0.4.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新；支持页面内嵌 zashboard、一键切换代理组、定时报告推送 Telegram/QQ/企业微信、趋势曲线与异常提醒 |
 
 ---
 
-# OpenClash 监控（OpenClashMonitor）
+# OpenClash 监控
 
-在 MoviePilot 里集中查看 OpenWrt / iStoreOS 上 **OpenClash（Mihomo / Clash Meta 内核）** 与 **LocalDNS** 的运行状况。
+在 MoviePilot 里集中查看 OpenWrt（iStoreOS / OpenWrt）上 OpenClash（Mihomo / Clash Meta 内核）与 LocalDNS 的运行状况。
 
 已在真实设备验证：iStoreOS + OpenClash `v0.48.002` + Mihomo `alpha-gbc76c13` + LocalDNS `FJGOE / 2026.10.23.2`。
 
@@ -21,31 +21,32 @@
 | 分类 | 内容 | 数据来源 |
 | --- | --- | --- |
 | 运行状态 | 运行/停止、运行模式（fake-ip / redir-host / tun 等）、规则模式（rule/global/direct）、CPU、负载、内存、活动连接数、累计上下行 | LuCI `status` + `toolbar_show`，缺失时回退 Clash API |
-| 节点信息 | 策略组列表、每组当前选择、成员数、在线数；每个节点的机场来源、类型、最新延迟、状态（正常/超时/未测速/离线） | Mihomo API `/proxies` + `/providers/proxies` |
+| 节点信息 | 策略组列表、每组当前选择、成员数、在线数；每个节点的机场来源、类型、最新延迟、状态（正常/超时/未测速/离线） | Clash API `/proxies` + `/providers/proxies` |
 | 订阅信息 | 每个配置文件的订阅 HTTP 状态、已用/总量/剩余流量、剩余天数、使用率 | LuCI `sub_info_get` + `config_name` |
 | 版本更新 | OpenClash 插件版本、Meta 内核版本，与上游最新版对比并标注「可更新」 | LuCI `update` + `last_version` |
 | LocalDNS | 运行状态、核心与 UI 版本、更新通道、监听地址、累计查询、拦截量与拦截率、缓存命中、屏蔽规则数、进程 CPU/内存/运行时长 | LocalDNS `/api/v1/status` + `/metrics` |
-| 上游 DNS 健康 | 按分组（domestic / foreign / foreign_ecs / proxy）列出每个上游的协议、请求数、失败数、超时数、平均延迟、最近一次错误 | LocalDNS `upstream_stats` |
+| 上游 DNS 健康 | 按分组（domestic / foreign / foreign_ecs / proxy）列出每个上游的协议、请求数、失败数、超时数、平均延迟、最近一次错误 | LocalDNS `/api/v1/status` 的 `upstream_stats` |
 | 查询日志 | 最近查询的时间、域名、类型、客户端、拦截/放行、耗时、响应码 | LocalDNS `/api/v1/querylog/entries` |
 | 主动探测 | 由 MoviePilot 直接向指定上游 DNS 发 UDP 查询，测量真实延迟与解析结果 | 内置 UDP 客户端，不依赖任何接口 |
 | 趋势曲线 | 节点在线数/总数、拦截率与上游平均延迟的历史曲线（按小时聚合） | 每次采集写入快照的 `trend` 字段 |
 | 异常提醒 | 采集失败、节点掉线比例超阈值、某条上游 DNS 连续失败、订阅即将到期或已过期 | 采集结果 + 通知渠道 |
-| 一键操作 | 启动/停止/重启 OpenClash、切换规则模式、切换策略组节点、清理 DNS/Fake-IP 缓存、关闭全部连接、切换配置文件 | 远程命令 + REST API（页面只读） |
-| Clash 内置 DNS | enhanced-mode（fake-ip/redir-host）、nameserver、fallback、fake-ip-range | Mihomo API `/configs` |
+| 一键操作 | 启动/停止/重启 OpenClash、切换规则模式、切换策略组节点、清理 DNS/Fake-IP 缓存、关闭全部连接、切换配置文件 | 远程命令 + REST API（页面只读，见下文） |
+| 内嵌面板 | 插件页里直接嵌入 zashboard，可在面板里切代理组、看连接与延迟 | zashboard 地址 + iframe（`html` 节点） |
+| 页面快捷切换 | 不用打开 zashboard，直接在插件页点按钮切规则模式、切策略组节点 | 页面 `events.click` → `POST /action_web` |
+| 定时报告 | 按 cron 把状态/节点/订阅/版本/DNS/告警汇总推送到 Telegram、QQ 或企业微信 | 调度任务 + `post_message(channel=...)` |
+| Clash 内置 DNS | enhanced-mode（fake-ip/redir-host）、nameserver、fallback、fake-ip-range | Clash API `/configs` |
 
-> 三路数据源互相独立：**Mihomo API 是必须的**（节点、运行状态、Clash DNS 都靠它）；**LuCI 是可选的**（订阅流量、插件/内核版本）；**LocalDNS 也是可选的**（查询日志、上游健康与版本）。缺哪一路，其余部分照常工作，页面上会明确提示缺失原因。
+> 三路数据源互相独立：**Clash API 是必须的**（节点、运行状态、Clash DNS 都靠它）；**LuCI 是可选的**（只有订阅流量和插件/内核版本需要它）；**LocalDNS 也是可选的**（查询日志、上游健康与版本）。缺哪一路，其余部分照常工作，页面上会明确提示缺失原因。
 
 ## 安装
 
-### 通过插件市场（推荐）
+```bash
+cd /path/to/MoviePilot-Plugins
+cp -r openclashmonitor plugins.v3/
+```
 
-1. MoviePilot → 设置 → 插件市场 → 添加仓库：`https://github.com/zimo650/MoviePilot-Plugins`
-2. 在插件市场里找到「OpenClash 监控」→ 安装
-3. 重启 MoviePilot 后在插件列表里配置并启用
-
-### 手动安装
-
-把 `plugins.v3/openclashmonitor/` 整个目录放进 MoviePilot 的插件仓库目录下的 `plugins.v3/`，再把根 `package.v3.json` 的 `OpenClashMonitor` 条目合并进目标仓库的索引文件，然后重启 MoviePilot。
+重启 MoviePilot，在「插件」里找到「OpenClash 监控」安装/启用即可。
+如果要发布到插件市场，还需要把本目录 `package.v3.json` 里的 `OpenClashMonitor` 条目合并进仓库根目录的索引文件。
 
 ## 配置
 
@@ -59,7 +60,7 @@
 | 路由器地址 | 形如 `http://192.168.1.1`，用于订阅流量与版本更新。没有 LuCI 访问时留空 |
 | LuCI Cookie | 已登录浏览器里复制 `sysauth_http=...`，优先级高于账号密码 |
 | LuCI 用户名 / 密码 | 用于自动登录，需路由器允许 `/cgi-bin/luci` 外部访问 |
-| LocalDNS 类型 | `localdns`（[yyhoworks/LocalDNS](https://github.com/yyhoworks/LocalDNS)，推荐）/ `adguard`（AdGuard Home）/ `none` |
+| LocalDNS 类型 | `localdns`（yyhoworks 的 LocalDNS，推荐）/ `adguard`（AdGuard Home）/ `none` |
 | LocalDNS 地址 | 形如 `http://192.168.1.1:19099`（LocalDNS 默认 API 端口 19099） |
 | 从 GitHub 检查版本 | 是否读取 LocalDNS 的 GitHub releases 与本地版本比较 |
 | AdGuard 地址 / 用户名 / 密码 | 形如 `http://192.168.1.1:3000`，走 Basic Auth（仅 `dns_mode=adguard` 时使用） |
@@ -75,12 +76,18 @@
 | 启用异常提醒 | 关闭后只在页面展示告警，不推送通知 |
 | 掉线比例阈值(%) | 节点掉线超过该比例时告警，默认 60 |
 | 上游失败次数阈值 | 单条上游累计失败/超时达到该次数时告警，默认 3 |
-| 订阅到期提醒(天) | 剩余天数小于等于该值时告警，默认 7 |
+| 订阅到期提醒(天) | 剩余天数小于等于该值时告警，默认 7（0 表示已过期也告警） |
 | 告警冷却(分钟) | 同一条告警在多久内不重复推送，默认 180 |
+| zashboard 面板地址 | 形如 `http://192.168.1.1:7116/`；留空则不显示内嵌面板 |
+| 面板高度(px) | 内嵌 iframe 的高度，默认 760 |
+| 启用定时报告 | 按 cron 主动推送监控报告 |
+| 定时表达式 | 五段式 cron（分 时 日 月 周），默认 `0 9 * * *` |
+| 通知渠道 | Telegram / QQ / 企业微信，可多选；留空跟随 MoviePilot 默认路由 |
+| 报告节点数 | 报告里列出最快的几个节点，默认 5 |
 
 ### 一键操作、趋势与异常提醒
 
-Vuetify 详情页是只读渲染，所以「一键操作」通过**远程命令**和**REST API** 触发，页面上有说明卡列出全部用法：
+Vuetify 详情页是只读渲染，所以「一键操作」通过**远程命令**和**REST API** 触发，页面上有一张说明卡列出全部用法：
 
 | 操作 | 远程命令 | API body |
 | --- | --- | --- |
@@ -97,29 +104,56 @@ curl -X POST "http://<MoviePilot地址>:3000/api/v1/plugin/OpenClashMonitor/acti
   -d '{"action":"rule","value":"global"}'
 ```
 
-`restart`、`stop`、`switch_config`、`close` 必须显式带 `confirm: true`；操作成功后会自动重新采集一次。
+`restart`、`stop`、`switch_config`、`close` 属于破坏性操作，必须显式带 `confirm: true`；操作成功后插件会自动重新采集一次。
 
-趋势：每采集一次写一个点（同小时覆盖），页面两张折线图展示「在线节点/节点总数」与「拦截率 %/上游平均延迟 ms」。
+趋势：每采集一次就往快照 `trend` 里写一个点（同小时覆盖），页面用两张折线图展示「在线节点/节点总数」和「拦截率 %/上游平均延迟 ms」。
 
-异常提醒：命中阈值时发通知（同告警按冷却期去重），页面顶部同步显示告警条。
+异常提醒：命中阈值时发通知（同一告警在冷却期内只发一次），同时页面上以红/黄告警条展示；告警状态存 7 天。
+
+### zashboard 面板与页面快捷切换
+
+插件页里直接内嵌 zashboard（`http://<你的zashboard地址>`），可以在里面切代理组、看连接与延迟；如果浏览器或反向代理禁止 iframe 嵌入，页面上有「在新窗口打开」按钮。
+
+面板下方还有一组纯页面按钮（不需要打开 zashboard）：
+
+- 一行「规则模式」按钮，点击即切换 `rule` / `global` / `direct`；
+- 每个策略组（在线数最多的前 4 组）列出最快 8 个节点，点一下就把该组切到该节点，当前选中项高亮。
+
+这些按钮调用的是 `POST /action_web`（`auth: "bear"`，用登录态鉴权，所以在浏览器里点即可），动作与 `/action` 一致但 `rule`/`node`/`flush`/`flush_smart` 无需再带 `confirm`；`restart`、`stop` 之类的破坏性操作仍只在 `/action` 里提供并要求 `confirm`。配置里关掉「启用一键操作」后，这组按钮与所有操作接口都会消失/被拒绝。
+
+### 定时报告
+
+在配置里打开「启用定时报告」并填 cron（默认 `0 9 * * *`，五段式：分 时 日 月 周），插件会注册一个调度任务，按点把当次报告推到通知渠道：
+
+- 通知渠道可选 Telegram、QQ、企业微信，可多选；留空则走 MoviePilot 的默认通知路由（哪个渠道开了「插件」消息就发哪个）。
+- 报告内容：运行状态、连接/内存/CPU/负载、节点在线率与最快的若干节点、订阅流量与到期、三个组件的版本更新、LocalDNS 统计与上游异常、主动探测结果、当前告警。
+- 页面上有「立即发送报告」按钮，等价于 `POST /report`；不依赖定时开关，可以随时手动发一条。
+- 也可以发远程命令：`/openclash_report` 发一条到默认渠道，`/openclash_report_channels telegram,qq` 临时指定渠道。
+
+## 定时任务
+
+| 任务 | 触发 | 说明 |
+| --- | --- | --- |
+| `OpenClashMonitor.Refresh` | `interval`（采集间隔） | 采集一次并写入快照、趋势、告警 |
+| `OpenClashMonitor.Report` | `cron`（定时表达式） | 仅在「启用定时报告」时注册 |
 
 ### 关于节点来源（重要）
 
-订阅型机场的节点**不会**出现在 Mihomo 的 `/proxies` 里：那里只有策略组和内置代理（`DIRECT` / `REJECT` / `直连` / `拒绝` / …）。
-真实节点在 `/providers/proxies` 的每个 provider 的 `proxies` 数组里。插件会把两侧合并成节点池，
+订阅型机场的节点**不会**出现在 Mihomo 的 `/proxies` 里：那里只有策略组和内置代理（`DIRECT`/`REJECT`/`直连`/`拒绝`/…）。
+真实节点在 `/providers/proxies` 的每个 provider 的 `proxies` 数组里（`机场一号` 173 个、`机场2号` 122 个、`红杏云` 68 个…）。插件会把两侧合并成节点池，
 所以节点列表里的「机场」列能看出每个节点来自哪个 provider；`/proxies` 里没有的成员也能正确计入策略组的在线数。
 
-> 判断「是不是真实节点」用的是 `type` 字段（`Direct` / `Reject` / `RejectDrop` / `Compatible` / `Pass` / `PassRule` / `Dns` 都算内置），
+> 判断「是不是真实节点」用的是 `type` 字段（`Direct`/`Reject`/`RejectDrop`/`Compatible`/`Pass`/`PassRule`/`Dns` 都算内置），
 > 不是名字名单——所以中文的「直连」「拒绝」也能正确排除。
 
 ### 关于「LocalDNS」
 
 路由器上的 DNS 实现常见有几种，本插件对它们的支持程度不同：
 
-- **LocalDNS（[yyhoworks/LocalDNS](https://github.com/yyhoworks/LocalDNS)）**：全部功能可用——状态、统计、上游健康、查询日志、进程指标、版本更新。
+- **LocalDNS（github.com/yyhoworks/LocalDNS）**：全部功能可用——状态、统计、上游健康、查询日志、进程指标、版本更新。
   上游健康来自它自己的统计（`upstream_stats`），比主动测速更贴近真实流量。
-- **AdGuard Home**：查询日志、拦截率、上游模式、上游测速 → 功能可用（上游健康需手动开启测速项）。
-- **Clash / Mihomo 内置 DNS**：不需要额外配置，插件总会展示 enhanced-mode、上游 nameserver、fake-ip 段。
+- **AdGuard Home**：查询日志、拦截率、上游模式、上游测速 → 功能可用，但上游健康需要在页面上手动点一次测速（`ag_test_upstream`）。
+- **Clash/Mihomo 内置 DNS**：不需要额外配置，插件总会展示 enhanced-mode、上游 nameserver、fake-ip 段。
 - **dnsmasq / SmartDNS / mosdns**：没有统一 HTTP API，插件只做「主动 UDP 探测」来判定上游是否健康；查询日志取不到。
 
 ### 关于 LocalDNS 版本更新
@@ -127,13 +161,13 @@ curl -X POST "http://<MoviePilot地址>:3000/api/v1/plugin/OpenClashMonitor/acti
 LocalDNS 没有自带的「检查更新」接口，插件用两个来源比对：
 
 - 本地：`GET /ui/version.json` → `uiVersion`、`backendVersion`（核心代号，如 `FJGOE`）、`releaseTag`。
-- 远端：`https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest` 的 tag，规则是 `<核心代号小写>-ui-v<UI版本>`。
+- 远端：`https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest` 的 tag，规则是 `<核心代号小写>-ui-v<UI版本>`（如 `fjgoe-ui-v2026.10.23.2`）。
 
 UI 版本按语义化版本比较；核心代号不同时会在页面上额外提示「通道不一致」。
 
 ## 对外 API
 
-全部 `GET`，路径前缀 `/api/v1/plugin/OpenClashMonitor`：
+全部 `GET`（最后三个为 `POST`），路径前缀 `/api/v1/plugin/OpenClashMonitor`：
 
 | 路径 | 说明 |
 | --- | --- |
@@ -147,29 +181,32 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 | `/trend` | 趋势曲线数据（节点、拦截率、上游延迟） |
 | `/alerts` | 当前告警列表 |
 | `POST /action` | 执行一键操作（`auth: apikey`，body 见上） |
+| `POST /action_web` | 页面按钮用的一键操作（`auth: bear`，`rule`/`node`/`flush`/`flush_smart` 免 `confirm`） |
+| `POST /report` | 立即发送报告（`auth: bear`，body 可带 `{"channels":["telegram"]}` 临时指定渠道） |
 
-Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势，
-另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`。
+Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势、`/openclash_report` 立即发一条报告，
+另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`、`/openclash_report_channels`。
 
 ## 已知限制
 
 1. **跨机访问 LuCI 需要登录**：登录请求必须带 `Referer: http://<路由器>/cgi-bin/luci/`，否则返回 403；
    且成功时是 `302 + Set-Cookie`，跟随跳转会丢掉会话 Cookie。插件已按此实现（`luci_username`/`luci_password` 与 `username`/`password` 两种字段名都会尝试），
    仍失败时请手工粘贴 `sysauth_http=...` Cookie。
-2. **订阅剩余流量依赖 OpenClash 自己的解析**：`sub_info_get` 里 `surplus` / `expire` / `day_left` 可能是字符串 `"null"`
+2. **订阅剩余流量依赖 OpenClash 自己的解析**：`sub_info_get` 里 `surplus`/`expire`/`day_left` 可能是字符串 `"null"`
    （该机场不提供流量或到期信息），插件会显示「不支持查询」/「未知」。
-3. **CPU 与内存是采样值**：OpenClash 新版 `toolbar_show` 直接给出 `cpu`（0~1 小数）与 `mem`；
-   老版本只有 `cpu_ticks` 时退化为两次采样求差。LocalDNS 的 CPU 也是两次采样 `/metrics` 求差。
-4. **主动 DNS 探测使用 UDP/53**：如果上游只支持 DoH/DoT，请把 `tls://`、`https://` 形式的地址留给 LocalDNS / AdGuard，
+3. **CPU 与内存是采样值**：OpenClash 新版 `toolbar_show` 直接给出 `cpu`（0~1 小数）与 `mem`，插件据此换算；
+   老版本只有 `cpu_ticks` 时退化为两次采样求差，误差在数百毫秒级。LocalDNS 的 CPU 也是两次采样 `/metrics` 求差。
+4. **主动 DNS 探测使用 UDP/53**：如果上游只支持 DoH/DoT，请把 `tls://`、`https://` 形式的地址留给 LocalDNS/AdGuard，
    不要放进主动探测列表。
 5. **新版 Mihomo 的 `/configs` 可能不再带 `dns` 段**（如 `alpha-gbc76c13`）：此时 `enhanced-mode`、上游 `nameserver`、
    fake-ip 段都取不到，插件改为按 LuCI `run_mode`（`fake-ip` / `redir-host`）推断 DNS 模式，上游列表请以 LocalDNS 面板为准。
 6. **订阅信息接口较慢**：`sub_info_get` 会现场请求机场的订阅链接，插件给它 3 倍超时（至少 20s），
    首轮采集可能比其他分区慢几秒。
-7. **一键操作会真实改变路由器状态**：重启/停止 OpenClash、关闭全部连接、切换配置文件会短暂断网，请确认后再执行。
-8. **趋势数据存在插件数据目录里**：清理 `plugin_data` 或重装插件会丢失历史点。
+7. **一键操作会真实改变路由器状态**：重启/停止 OpenClash、关闭全部连接、切换配置文件会短暂断网，
+   请确认后再执行；不确定时先把「启用一键操作」关掉。
+8. **趋势数据存在插件数据目录里**：MoviePilot 重装或清理 `plugin_data` 会丢失历史点，重新采集后会从头累积。
+9. **内嵌面板受浏览器/X-Frame-Options 影响**：zashboard 本身允许 iframe，但如果你在前面加了带 `X-Frame-Options: DENY`
+   的反向代理，面板会空白，请用「在新窗口打开」。
+10. **定时报告依赖宿主的 CronTrigger**：APScheduler 缺失时插件只会在日志里告警并退化为只能手动发报告。
+    报告走 MoviePilot 的「插件」消息类型，请确认对应渠道的插件消息开关是打开的。
 
-
-## 许可
-
-插件代码可自由使用、修改与分发。使用前请自行确认你的网络环境与安全策略。
