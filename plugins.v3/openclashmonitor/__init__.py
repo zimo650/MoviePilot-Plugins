@@ -562,8 +562,8 @@ class OpenClashMonitor(_PluginBase):
     )
     plugin_icon = "Moviepilot_A.png"
     plugin_version = "0.2.1"
-    plugin_author = "your-name"
-    author_url = "https://github.com/your-name"
+    plugin_author = "zimo650"
+    author_url = "https://github.com/zimo650"
     plugin_config_prefix = "openclashmonitor_"
     plugin_label = "OpenClash,网络,DNS,监控"
     plugin_order = 30
