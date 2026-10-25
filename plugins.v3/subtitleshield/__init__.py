@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -241,8 +241,9 @@ class SubtitleShield(_PluginBase):
                                                                                 "hint": "匹配时加 .default 前缀，如 zh-cn"}}),
                             self.__col(3, {"component": "VTextField", "props": {"modelValue": self._prefer_format, "label": "格式优先级",
                                                                                 "hint": "ass,srt,ssa,vtt,sup"}}),
-                            self.__col(2, {"component": "VSwitch", "props": {"modelValue": self._content_detect, "label": "读内容判定",
-                                                                             "density": "compact"}}),
+                            self.__col(2, {"component": "VSwitch", "props": {"modelValue": self._auto_apply, "label": "自动执行",
+                                                                             "density": "compact",
+                                                                             "hint": "定时任务是否直接改名（建议先关）"}}),
                             self.__col(2, {"component": "VTextField", "props": {"modelValue": self._min_chars, "label": "最少字符",
                                                                                 "type": "number"}}),
                             self.__col(2, {"component": "VTextField", "props": {"modelValue": self._timeout, "label": "超时(秒)",
@@ -391,6 +392,11 @@ class SubtitleShield(_PluginBase):
                 group.sort(key=lambda x: (_fmt_rank(x["sub"]["ext"], prefer), -x["sub"]["size"]))
                 for idx, item in enumerate(group):
                     sub = item["sub"]
+                    if lang == "unknown":
+                        skipped.append({"video": video["name"], "subtitle": sub["name"],
+                                        "lang_label": "未识别",
+                                        "reason": f"语言未识别（{item['source']}），保持原样"})
+                        continue
                     need = os.path.basename(item["target"]) != sub["name"]
                     entry = {
                         "video": video["name"], "dir": video["dir"], "subtitle": sub["name"],
@@ -449,17 +455,22 @@ class SubtitleShield(_PluginBase):
     # ------------------------------------------------------------- 语言判定
 
     def __detect_language(self, sub: Dict[str, Any]) -> Tuple[str, str, str]:
-        lang, source = _lang_from_name(sub["name"])
-        if lang != "unknown":
-            return lang, source, "high"
-        if not self._content_detect:
-            return "unknown", "未识别", "none"
-        try:
-            lang, source, conf = self.__detect_from_content(sub["path"])
+        lang, source, conf = _lang_from_name(sub["name"])
+        if conf == "high":
             return lang, source, conf
-        except Exception as e:
-            logger.debug(f"{self.plugin_name}：读取 {sub['name']} 失败 {e}")
-            return "unknown", "读取失败", "none"
+        content: Tuple[str, str, str] = ("unknown", "未识别", "none")
+        if self._content_detect:
+            try:
+                content = self.__detect_from_content(sub["path"])
+            except Exception as e:
+                logger.debug(f"{self.plugin_name}：读取 {sub['name']} 失败 {e}")
+                content = ("unknown", "读取失败", "none")
+        if content[0] != "unknown":
+            # 正文证据优先于 zh-Hans / zh-Hant 这类弱标识（实测站内抽流常标错）
+            return content
+        if lang != "unknown":
+            return lang, source, conf
+        return content
 
     def __detect_from_content(self, path: str) -> Tuple[str, str, str]:
         raw = b""
@@ -856,6 +867,12 @@ _NAME_PATTERNS = [
     ("en", re.compile(r"(?i)(\beng\b|\benglish\b|英文|英语|英語)")),
 ]
 
+# 弱标识：站内抽流常用 zh-Hans / zh-Hant，实测经常标错，正文能判出来时以正文为准
+_SOFT_NAME_PATTERNS = [
+    ("zh_tw", re.compile(r"(?i)(zh[-_.]?hant|hant\b)")),
+    ("zh_cn", re.compile(r"(?i)(zh[-_.]?hans|hans\b)")),
+]
+
 # 常用简繁字对（左简右繁），用于内容判定
 _SIMP_TRAD_PAIRS = (
     "这這 说說 时時 会會 个個 们們 为為 国國 门門 问問 间間 关關 开開 后後 里裡 发發 现現 学學 "
@@ -961,12 +978,16 @@ def _fmt_rank(ext: str, prefer: List[str]) -> int:
         return len(prefer)
 
 
-def _lang_from_name(name: str) -> Tuple[str, str]:
+def _lang_from_name(name: str) -> Tuple[str, str, str]:
+    """文件名判语种：强标识（chs/cht/zh-cn/简/繁）优先，弱标识（zh-Hans/zh-Hant）留给正文覆盖。"""
     text = name.lower()
     for lang, pattern in _NAME_PATTERNS:
         if pattern.search(text):
-            return lang, f"文件名含 {lang} 标识"
-    return "unknown", "文件名无语言标识"
+            return lang, f"文件名含 {lang} 标识", "high"
+    for lang, pattern in _SOFT_NAME_PATTERNS:
+        if pattern.search(text):
+            return lang, f"文件名含 {lang} 中文标识（弱）", "low"
+    return "unknown", "文件名无语言标识", "none"
 
 
 def _decode_text(raw: bytes) -> str:
