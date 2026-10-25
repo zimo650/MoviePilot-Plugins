@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -636,6 +636,7 @@ class SubtitleShield(_PluginBase):
             "待规范化清单", ("视频", "当前字幕", "判定", "依据", "目标名", "动作"), rows,
             md=12, icon="mdi-file-rename",
             empty_text="暂无待处理字幕，全部已符合命名规范",
+            widths=("22%", "24%", "8%", "12%", "28%", "6%"),
             caption=f"最多展示 50 条；共 {summary.get('pending', 0)} 条待处理")]
 
         dup_rows = [[it["video"], it["subtitle"], it["lang_label"], it.get("reason", "")]
@@ -644,6 +645,7 @@ class SubtitleShield(_PluginBase):
             "将删除的多余字幕" if self._dedupe_duplicates else "同语言重复（仅提示）",
             ("视频", "字幕", "判定", "说明"), dup_rows, md=6, icon="mdi-content-duplicate",
             empty_text="没有同语言重复的字幕",
+            widths=("26%", "28%", "8%", "38%"),
             caption=("已开启删除：每轮最多删除「每轮最多处理」条，保留格式最优的一份"
                      if self._dedupe_duplicates else "同一语言保留格式最好的一份，其余只提示不删除")))
 
@@ -652,18 +654,21 @@ class SubtitleShield(_PluginBase):
         cards.append(self.__table_card(
             "已跳过", ("视频", "字幕", "原因"), skip_rows, md=6, icon="mdi-skip-next-circle-outline",
             empty_text="没有跳过的字幕",
+            widths=("28%", "28%", "44%"),
             caption="语言无法识别时不改名，避免误伤"))
 
         done_rows = [[it["video"], it["subtitle"], it["target"]] for it in apply_result.get("done", [])[:30]]
         cards.append(self.__table_card(
             "最近已处理", ("视频", "原字幕", "新字幕"), done_rows, md=6, icon="mdi-history",
             empty_text="还没有执行过真实写入",
+            widths=("30%", "30%", "40%"),
             caption="来自上一次真实写入"))
 
         err_rows = [[it.get("subtitle", ""), it.get("reason", "")] for it in apply_result.get("errors", [])[:20]]
         cards.append(self.__table_card(
             "失败与跳过", ("字幕", "原因"), err_rows, md=6, icon="mdi-alert-circle-outline",
             empty_text="没有失败项",
+            widths=("34%", "66%"),
             caption="改名失败或目标冲突时会记录在这里"))
 
         # 表格卡必须放在 VRow 里：VCol 脱离 VRow 会少掉负外边距，宽度比上面的统计卡窄一截
@@ -729,24 +734,39 @@ class SubtitleShield(_PluginBase):
     @classmethod
     def __table_card(cls, title: str, headers: Tuple[str, ...], rows: List[List[Any]],
                      *, md: int = 6, caption: str = "", icon: str = "",
-                     empty_text: str = "暂无记录") -> Dict[str, Any]:
+                     empty_text: str = "暂无记录", widths: Optional[Tuple[str, ...]] = None) -> Dict[str, Any]:
+        """表格卡。
+
+        Vuetify 的表格单元格默认不换行，长文件名会把表格撑出横向滚动条；这里给每列指定
+        百分比宽度并允许换行（table-layout: fixed），让内容在卡片宽度内折行显示。
+        """
+        cell_style = "white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+
+        def head_cell(idx: int, text: str) -> Dict[str, Any]:
+            style = cell_style
+            if widths and idx < len(widths):
+                style += f" width: {widths[idx]};"
+            return {"component": "th", "props": {"class": "text-caption font-weight-medium", "style": style},
+                    "text": text}
+
         head = {"component": "thead", "content": [
-            {"component": "tr", "content": [
-                {"component": "th", "props": {"class": "text-caption font-weight-medium"}, "text": h}
-                for h in headers]}]}
+            {"component": "tr", "content": [head_cell(i, h) for i, h in enumerate(headers)]}]}
         body_rows = []
         if rows:
             for row in rows:
                 body_rows.append({"component": "tr", "content": [
-                    {"component": "td", "props": {"class": "text-caption"}, "text": str(c)} for c in row]})
+                    {"component": "td", "props": {"class": "text-caption", "style": cell_style},
+                     "text": str(c)} for c in row]})
         else:
             body_rows.append({"component": "tr", "content": [
                 {"component": "td",
-                 "props": {"colspan": len(headers), "class": "text-caption text-medium-emphasis"},
+                 "props": {"colspan": len(headers), "class": "text-caption text-medium-emphasis",
+                           "style": cell_style},
                  "text": empty_text}]})
         inner: List[dict] = [cls.__card_title(title, icon)]
-        body: List[dict] = [{"component": "VTable", "props": {"density": "compact", "hover": True},
-                             "content": [head, {"component": "tbody", "content": body_rows}]}]
+        body: List[dict] = [{"component": "VTable", "props": {
+            "density": "compact", "hover": True, "style": "table-layout: fixed; width: 100%;"},
+            "content": [head, {"component": "tbody", "content": body_rows}]}]
         if caption:
             body.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"},
                          "text": caption})
