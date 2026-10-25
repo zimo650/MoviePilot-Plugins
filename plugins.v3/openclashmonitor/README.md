@@ -149,7 +149,11 @@ curl -X POST "http://<MoviePilot地址>:3000/api/v1/plugin/OpenClashMonitor/acti
 LocalDNS 没有自带的「检查更新」接口，插件用两个来源比对：
 
 - 本地：`GET /ui/version.json` → `uiVersion`、`backendVersion`（核心代号，如 `FJGOE`）、`releaseTag`。
-- 远端：`https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest` 的 tag，规则是 `<核心代号小写>-ui-v<UI版本>`（如 `fjgoe-ui-v2026.10.23.2`）。
+- 远端按三条路径依次尝试，任意一条成功即用（页面的「版本与更新」卡片会标注当前来源）：
+  1. `https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest` 的 tag，规则是 `<核心代号小写>-ui-v<UI版本>`（如 `fjgoe-ui-v2026.10.23.3`）；
+  2. `https://raw.githubusercontent.com/yyhoworks/LocalDNS/main/VERSION.json`（仓库根目录的版本文件，`uiVersion` / `backendVersion` / `releaseTag`）；
+  3. `https://cdn.jsdelivr.net/gh/yyhoworks/LocalDNS@main/VERSION.json`（jsDelivr 镜像，api.github.com 被墙时基本可用）。
+- 国内网络经常访问不了 `api.github.com`，所以必须有后两条兜底；三条都失败时「最新版本」显示 `-`、状态显示「未知」，卡片底部会写出失败原因。
 
 UI 版本按语义化版本比较；核心代号不同时会在页面上额外提示「通道不一致」。
 
@@ -174,6 +178,11 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 
 Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势、`/openclash_report` 立即发一条报告，
 另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`、`/openclash_report_channels`。
+
+## 页面布局
+
+- 所有卡片宽度一致、从上到下依次排列；内容少的「版本与更新」和「订阅信息」合并成一行（各占一半），其余卡片整行占满。
+- 表格单元格允许换行、按百分比固定列宽（`table-layout: fixed`），长文件名/长节点名在卡片内折行，不会撑出横向滚动条。
 
 ## 已知限制
 
