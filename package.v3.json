@@ -21,13 +21,14 @@
     "name": "字幕规范化",
     "description": "统一媒体库外挂字幕的命名：文件名优先、字幕正文兜底判断简体/繁体，重命名成与视频同名并带语言标签（chi.zh-cn / zh-tw，可切换 chs/cht）；支持简繁共存、同语言去重提示、历史库批量规范化，并按条目或库刷新 Emby。",
     "labels": "工具,字幕",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "icon": "Moviepilot_A.png",
     "author": "zimo650",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v0.1.2": "新增 Emby 路径映射（容器路径与 Emby 库路径不一致时也能通知到）与「更新视频时间戳」，改名后动一下视频 mtime 让 Emby 重新探测外挂字幕；扫描文件上限从 2 万提高到 20 万",
       "v0.1.1": "zh-Hans / zh-Hant 这类站内抽流标签降级为弱标识：正文能判出简繁时以正文为准（实测存在标 zh-Hans 实际是繁体的情况）；语言确实无法识别时不再改名，只在跳过列表里提示，避免把语言标签改丢",
       "v0.1.0": "初始版本：扫描媒体库字幕，文件名优先 + 正文兜底判定简繁，按 MoviePilot 原生风格重命名（chi.zh-cn / zh-tw，默认语言加 .default），支持简繁共存、同语言去重提示、dry_run 试跑与 limit 限流、Emby 条目/库刷新"
     }
