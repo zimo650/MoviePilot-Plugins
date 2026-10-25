@@ -6,7 +6,7 @@
 
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
-| `OpenClashMonitor` | OpenClash 监控 | 0.2.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新 |
+| `OpenClashMonitor` | OpenClash 监控 | 0.3.0 | 在 MoviePilot 里监控 OpenClash（Mihomo/Clash Meta）与 LocalDNS 的运行状态、节点与订阅、上游 DNS 健康、查询日志与版本更新，并支持一键操作、趋势曲线与异常提醒 |
 
 ---
 
@@ -28,6 +28,9 @@
 | 上游 DNS 健康 | 按分组（domestic / foreign / foreign_ecs / proxy）列出每个上游的协议、请求数、失败数、超时数、平均延迟、最近一次错误 | LocalDNS `upstream_stats` |
 | 查询日志 | 最近查询的时间、域名、类型、客户端、拦截/放行、耗时、响应码 | LocalDNS `/api/v1/querylog/entries` |
 | 主动探测 | 由 MoviePilot 直接向指定上游 DNS 发 UDP 查询，测量真实延迟与解析结果 | 内置 UDP 客户端，不依赖任何接口 |
+| 趋势曲线 | 节点在线数/总数、拦截率与上游平均延迟的历史曲线（按小时聚合） | 每次采集写入快照的 `trend` 字段 |
+| 异常提醒 | 采集失败、节点掉线比例超阈值、某条上游 DNS 连续失败、订阅即将到期或已过期 | 采集结果 + 通知渠道 |
+| 一键操作 | 启动/停止/重启 OpenClash、切换规则模式、切换策略组节点、清理 DNS/Fake-IP 缓存、关闭全部连接、切换配置文件 | 远程命令 + REST API（页面只读） |
 | Clash 内置 DNS | enhanced-mode（fake-ip/redir-host）、nameserver、fallback、fake-ip-range | Mihomo API `/configs` |
 
 > 三路数据源互相独立：**Mihomo API 是必须的**（节点、运行状态、Clash DNS 都靠它）；**LuCI 是可选的**（订阅流量、插件/内核版本）；**LocalDNS 也是可选的**（查询日志、上游健康与版本）。缺哪一路，其余部分照常工作，页面上会明确提示缺失原因。
@@ -67,6 +70,38 @@
 | 节点显示上限 | 页面上最多列多少个节点，默认 15（总数仍按实际数量统计） |
 | 查询日志条数 | 最多展示多少条查询日志，默认 20 |
 | 请求超时 | 秒，默认 8 |
+| 启用一键操作 | 关闭后所有操作命令与 `/action` 接口都会被拒绝 |
+| 趋势保留天数 | 趋势点保留多少天，默认 7（按小时聚合，最多 336 点） |
+| 启用异常提醒 | 关闭后只在页面展示告警，不推送通知 |
+| 掉线比例阈值(%) | 节点掉线超过该比例时告警，默认 60 |
+| 上游失败次数阈值 | 单条上游累计失败/超时达到该次数时告警，默认 3 |
+| 订阅到期提醒(天) | 剩余天数小于等于该值时告警，默认 7 |
+| 告警冷却(分钟) | 同一条告警在多久内不重复推送，默认 180 |
+
+### 一键操作、趋势与异常提醒
+
+Vuetify 详情页是只读渲染，所以「一键操作」通过**远程命令**和**REST API** 触发，页面上有说明卡列出全部用法：
+
+| 操作 | 远程命令 | API body |
+| --- | --- | --- |
+| 重启 / 启动 / 停止 | `/openclash_restart`、`/openclash_start`、`/openclash_stop` | `{"action":"restart","confirm":true}` |
+| 切换规则模式 | `/openclash_rule rule`（`rule`/`global`/`direct`） | `{"action":"rule","value":"global"}` |
+| 切换节点 | `/openclash_node 组名 节点名` | `{"action":"node","group":"节点选择","value":"香港 01"}` |
+| 清理 DNS/Fake-IP 缓存 | `/openclash_flush` | `{"action":"flush"}` |
+| 关闭全部连接 | — | `{"action":"close","confirm":true}` |
+| 切换配置文件 | — | `{"action":"switch_config","value":"config.yaml","confirm":true}` |
+
+```bash
+curl -X POST "http://<MoviePilot地址>:3000/api/v1/plugin/OpenClashMonitor/action?apikey=<你的API密钥>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"rule","value":"global"}'
+```
+
+`restart`、`stop`、`switch_config`、`close` 必须显式带 `confirm: true`；操作成功后会自动重新采集一次。
+
+趋势：每采集一次写一个点（同小时覆盖），页面两张折线图展示「在线节点/节点总数」与「拦截率 %/上游平均延迟 ms」。
+
+异常提醒：命中阈值时发通知（同告警按冷却期去重），页面顶部同步显示告警条。
 
 ### 关于节点来源（重要）
 
@@ -109,8 +144,12 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 | `/versions` | 版本对比结果 |
 | `/dns` | LocalDNS 与上游 DNS 健康 |
 | `/probe` | 立即重新探测上游 DNS |
+| `/trend` | 趋势曲线数据（节点、拦截率、上游延迟） |
+| `/alerts` | 当前告警列表 |
+| `POST /action` | 执行一键操作（`auth: apikey`，body 见上） |
 
-Telegram / 微信命令：`/openclash` 返回一段运行状态摘要。
+Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势，
+另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`。
 
 ## 已知限制
 
@@ -127,6 +166,8 @@ Telegram / 微信命令：`/openclash` 返回一段运行状态摘要。
    fake-ip 段都取不到，插件改为按 LuCI `run_mode`（`fake-ip` / `redir-host`）推断 DNS 模式，上游列表请以 LocalDNS 面板为准。
 6. **订阅信息接口较慢**：`sub_info_get` 会现场请求机场的订阅链接，插件给它 3 倍超时（至少 20s），
    首轮采集可能比其他分区慢几秒。
+7. **一键操作会真实改变路由器状态**：重启/停止 OpenClash、关闭全部连接、切换配置文件会短暂断网，请确认后再执行。
+8. **趋势数据存在插件数据目录里**：清理 `plugin_data` 或重装插件会丢失历史点。
 
 
 ## 许可
