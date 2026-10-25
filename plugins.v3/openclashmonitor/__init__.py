@@ -183,6 +183,22 @@ def _format_uptime(value: Any) -> str:
     return f"{minutes} 分"
 
 
+def _dns_mode_from_run_mode(run_mode: str) -> str:
+    """OpenClash 的运行模式可以反推 Fake-IP / Redir-Host。
+
+    新版 Mihomo（如 alpha-gbc76c13）不再在 ``/configs`` 里返回 ``dns`` 段，
+    因此 enhanced-mode 只能从 LuCI 的 ``run_mode``（fake-ip-tun / redir-host-mix …）里推断。
+    """
+    text = str(run_mode or "").strip().lower()
+    if not text:
+        return ""
+    if "fake-ip" in text or "fakeip" in text:
+        return "fake-ip"
+    if "redir-host" in text or "redir_host" in text:
+        return "redir-host"
+    return ""
+
+
 def _clean_loading(value: Any) -> str:
     """清理 LuCI 返回的 "loading..." 等占位值。"""
     text = str(value or "").strip()
@@ -545,7 +561,7 @@ class OpenClashMonitor(_PluginBase):
         "插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "your-name"
     author_url = "https://github.com/your-name"
     plugin_config_prefix = "openclashmonitor_"
@@ -994,12 +1010,19 @@ class OpenClashMonitor(_PluginBase):
         current_config = self.__current_config_name(config_doc)
         sub_doc = None
         if current_config:
-            sub_doc, sub_err = self.__luci_get("sub_info_get", {"filename": current_config})
+            # sub_info_get 会现场去拉订阅链接，明显慢于其他接口，单独放宽超时
+            sub_doc, sub_err = self.__luci_get(
+                "sub_info_get", {"filename": current_config},
+                timeout=max(float(self._timeout or 8) * 3.0, 20.0),
+            )
             if sub_err:
                 errors.append(f"订阅信息：{sub_err}")
 
         # 4) DNS
-        dns_view, dns_errors = self.__collect_dns(configs_doc)
+        dns_view, dns_errors = self.__collect_dns(
+            configs_doc,
+            str((luci_status or {}).get("run_mode") or "") if isinstance(luci_status, dict) else "",
+        )
         errors.extend(dns_errors)
         probe = self.__collect_probe()
 
@@ -1126,7 +1149,8 @@ class OpenClashMonitor(_PluginBase):
             "core_version": str((version_doc or {}).get("version") or "") if isinstance(version_doc, dict) else "",
             "meta": bool((version_doc or {}).get("meta")) if isinstance(version_doc, dict) else None,
             "api_url": clash_base,
-            "dns_mode": str(dns_cfg.get("enhanced-mode") or dns_cfg.get("enhanced_mode") or ""),
+            "dns_mode": str(dns_cfg.get("enhanced-mode") or dns_cfg.get("enhanced_mode") or "")
+            or _dns_mode_from_run_mode(str(status.get("run_mode") or "")),
             "dns_upstreams": [str(x) for x in (dns_cfg.get("nameserver") or []) if x] if isinstance(
                 dns_cfg.get("nameserver"), list) else [],
             "fakeip_range": str(dns_cfg.get("fake-ip-range") or dns_cfg.get("fake_ip_range") or ""),
@@ -1445,7 +1469,7 @@ class OpenClashMonitor(_PluginBase):
     # 采集：LocalDNS
     # ------------------------------------------------------------------
 
-    def __collect_dns(self, configs_doc: Any) -> Tuple[Dict[str, Any], List[str]]:
+    def __collect_dns(self, configs_doc: Any, run_mode: str = "") -> Tuple[Dict[str, Any], List[str]]:
         """采集 LocalDNS 视图。"""
         errors: List[str] = []
         view: Dict[str, Any] = {
@@ -1471,7 +1495,8 @@ class OpenClashMonitor(_PluginBase):
         if isinstance(configs_doc, dict):
             dns_cfg = configs_doc.get("dns") if isinstance(configs_doc.get("dns"), dict) else {}
             view["clash"] = {
-                "mode": str(dns_cfg.get("enhanced-mode") or dns_cfg.get("enhanced_mode") or ""),
+                "mode": str(dns_cfg.get("enhanced-mode") or dns_cfg.get("enhanced_mode") or "")
+                or _dns_mode_from_run_mode(run_mode),
                 "nameserver": [str(x) for x in (dns_cfg.get("nameserver") or []) if x]
                 if isinstance(dns_cfg.get("nameserver"), list) else [],
                 "fallback": [str(x) for x in (dns_cfg.get("fallback") or []) if x]
@@ -2671,7 +2696,8 @@ class OpenClashMonitor(_PluginBase):
     # LuCI 访问
     # ------------------------------------------------------------------
 
-    def __luci_get(self, action: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Any, Optional[str]]:
+    def __luci_get(self, action: str, params: Optional[Dict[str, Any]] = None,
+                   timeout: Optional[float] = None) -> Tuple[Any, Optional[str]]:
         """请求 OpenClash 的 LuCI 接口，必要时自动登录。"""
         if not self._luci_url:
             return None, "未配置路由器地址"
@@ -2681,7 +2707,7 @@ class OpenClashMonitor(_PluginBase):
                 "GET", url,
                 headers={"X-Requested-With": "XMLHttpRequest"},
                 params=params,
-                timeout=self._timeout,
+                timeout=timeout or self._timeout,
                 cookies=self.__cookie_jar(),
             )
             if result["cookies"]:
