@@ -254,7 +254,11 @@ MoviePilot 的 `plugin.install` 在插件已存在时，会把**已安装目录�
 3. 回到插件市场点安装（`plugin.install` 带上仓库地址 `repo_url`），装完确认版本号；
 4. 重启一次 MoviePilot，让下载完成事件的钩子重新注册。
 
-本仓库附带 `devtools/update_mp.py` 把这套流程串成一条命令（市场刷新 → 安装 → 校验版本 → 不符则自动卸载并清理目录后重装）。
+本仓库附带 `tools/update_mp.py` 把这套流程串成一条命令（市场刷新 → 安装 → 校验版本 → 不符则自动卸载并清理目录后重装）：
+
+```bash
+MP_APIKEY=<你的 API 密钥> python tools/update_mp.py --expect 0.2.0
+```
 
 ## 配置项
 
