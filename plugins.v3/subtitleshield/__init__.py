@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -632,15 +632,15 @@ class SubtitleShield(_PluginBase):
 
         rows = [[it["video"], it["subtitle"], it["lang_label"], f"{it['confidence']}（{it['source']}）",
                  it["target"], "改名"] for it in plan.get("items", [])[:50]]
-        content.append(self.__table_card(
+        cards: List[dict] = [self.__table_card(
             "待规范化清单", ("视频", "当前字幕", "判定", "依据", "目标名", "动作"), rows,
             md=12, icon="mdi-file-rename",
             empty_text="暂无待处理字幕，全部已符合命名规范",
-            caption=f"最多展示 50 条；共 {summary.get('pending', 0)} 条待处理"))
+            caption=f"最多展示 50 条；共 {summary.get('pending', 0)} 条待处理")]
 
         dup_rows = [[it["video"], it["subtitle"], it["lang_label"], it.get("reason", "")]
                     for it in (plan.get("removals") or plan.get("duplicates") or [])[:20]]
-        content.append(self.__table_card(
+        cards.append(self.__table_card(
             "将删除的多余字幕" if self._dedupe_duplicates else "同语言重复（仅提示）",
             ("视频", "字幕", "判定", "说明"), dup_rows, md=6, icon="mdi-content-duplicate",
             empty_text="没有同语言重复的字幕",
@@ -649,22 +649,25 @@ class SubtitleShield(_PluginBase):
 
         skip_rows = [[it["video"], it["subtitle"], it.get("reason", "")]
                      for it in plan.get("skipped", [])[:20]]
-        content.append(self.__table_card(
+        cards.append(self.__table_card(
             "已跳过", ("视频", "字幕", "原因"), skip_rows, md=6, icon="mdi-skip-next-circle-outline",
             empty_text="没有跳过的字幕",
             caption="语言无法识别时不改名，避免误伤"))
 
         done_rows = [[it["video"], it["subtitle"], it["target"]] for it in apply_result.get("done", [])[:30]]
-        content.append(self.__table_card(
+        cards.append(self.__table_card(
             "最近已处理", ("视频", "原字幕", "新字幕"), done_rows, md=6, icon="mdi-history",
             empty_text="还没有执行过真实写入",
             caption="来自上一次真实写入"))
 
         err_rows = [[it.get("subtitle", ""), it.get("reason", "")] for it in apply_result.get("errors", [])[:20]]
-        content.append(self.__table_card(
+        cards.append(self.__table_card(
             "失败与跳过", ("字幕", "原因"), err_rows, md=6, icon="mdi-alert-circle-outline",
             empty_text="没有失败项",
             caption="改名失败或目标冲突时会记录在这里"))
+
+        # 表格卡必须放在 VRow 里：VCol 脱离 VRow 会少掉负外边距，宽度比上面的统计卡窄一截
+        content.append({"component": "VRow", "content": cards})
 
         if report.get("errors"):
             content.append({"component": "VRow", "content": [
@@ -689,10 +692,11 @@ class SubtitleShield(_PluginBase):
             self.__stat_card("待规范化", summary.get("pending", 0), "mdi-file-rename"),
             self.__stat_card("已合规", summary.get("kept", 0), "mdi-check-decagram"),
         ]}]
-        widgets.append({"component": "VAlert", "props": {
-            "type": "info" if self._dry_run else "warning", "variant": "tonal",
-            "text": f"{'只预览' if self._dry_run else '可写入'} · 上次扫描 {plan.get('timestamp') or '未扫描'} · "
-                    f"待处理 {summary.get('pending', 0)} 条"}})
+        widgets.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 12},
+                        "content": [{"component": "VAlert", "props": {
+                            "type": "info" if self._dry_run else "warning", "variant": "tonal",
+                            "text": f"{'只预览' if self._dry_run else '可写入'} · 上次扫描 {plan.get('timestamp') or '未扫描'} · "
+                                    f"待处理 {summary.get('pending', 0)} 条"}}]}]})
         return {"cols": 12, "md": 6}, {"refresh": 30, "title": "字幕规范化"}, widgets
 
     @staticmethod
@@ -741,12 +745,12 @@ class SubtitleShield(_PluginBase):
                  "props": {"colspan": len(headers), "class": "text-caption text-medium-emphasis"},
                  "text": empty_text}]})
         inner: List[dict] = [cls.__card_title(title, icon)]
-        inner.append({"component": "VCardText", "props": {"class": "pt-0"}, "content": [
-            {"component": "VTable", "props": {"density": "compact", "hover": True},
-             "content": [head, {"component": "tbody", "content": body_rows}]}]})
+        body: List[dict] = [{"component": "VTable", "props": {"density": "compact", "hover": True},
+                             "content": [head, {"component": "tbody", "content": body_rows}]}]
         if caption:
-            inner.append({"component": "VCardText", "props": {"class": "pt-0 text-caption text-medium-emphasis"},
-                          "text": caption})
+            body.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                         "text": caption})
+        inner.append({"component": "VCardText", "props": {"class": "pt-0 pb-4"}, "content": body})
         return {"component": "VCol", "props": {"cols": 12, "md": md},
                 "content": [{"component": "VCard", "props": {"variant": "tonal", "class": "mb-4 h-100"},
                              "content": inner}]}
