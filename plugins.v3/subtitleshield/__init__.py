@@ -84,7 +84,7 @@ class SubtitleShield(_PluginBase):
     plugin_name = "字幕规范化"
     plugin_desc = "按内容判定简繁、把字幕统一成 MoviePilot 命名规范、简繁共存，并按条目刷新 Emby"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.1.4"
+    plugin_version = "0.1.5"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "subtitleshield_"
@@ -428,6 +428,9 @@ class SubtitleShield(_PluginBase):
                     }
                     if idx > 0:
                         duplicates.append({**entry, "reason": "同语言重复，未处理"})
+                        continue
+                    if need and os.path.exists(os.path.join(video["dir"], entry["target"])):
+                        duplicates.append({**entry, "reason": "目标文件已存在，按重复处理"})
                         continue
                     if need:
                         items.append(entry)
