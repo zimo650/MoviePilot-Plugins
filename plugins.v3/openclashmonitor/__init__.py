@@ -1,7 +1,7 @@
 """OpenClash 监控插件。
 
 在 MoviePilot 中集中查看 OpenClash（Mihomo 内核）的运行状态、节点与订阅信息，
-并监控 LocalDNS 的查询情况、版本更新与上游 DNS 健康状态。
+并监控 AtomDNS（或旧版 LocalDNS / AdGuard Home）的查询情况、版本更新与上游 DNS 健康状态。
 
 数据来源分三路，全部可独立配置，缺一路不影响其它面板：
 
@@ -12,14 +12,17 @@
    订阅剩余流量与到期、插件与内核的最新版本、连接数、内存与 CPU。
    跨机访问需要 LuCI 登录态：登录必须带 Referer，且要靠 302 响应里的 Set-Cookie
    拿会话（跟随跳转会丢 cookie），插件同时支持手工粘贴 sysauth cookie。
-3. LocalDNS：默认对接 https://github.com/yyhoworks/LocalDNS（状态/统计/上游健康/
-   查询日志/进程指标/版本），也兼容 AdGuard Home 的 HTTP API，另有不依赖任何 API
-   的 UDP DNS 主动探测（对任意上游服务器测延迟）。
+3. DNS 程序：默认对接 **AtomDNS**（https://github.com/jasonxtt/atomdns，WebUI/API
+   默认 19100 端口）——运行状态、分流模式、上游健康（``/metrics`` 累计请求/错误/
+   延迟直方图）、查询量与拦截（``/api/v2/audit/*``）、查询日志、缓存命中、定时
+   刷新与版本更新；同时保留旧版 LocalDNS（19099，已于 2026-11 退役）与
+   AdGuard Home 的 HTTP API 适配，另有不依赖任何管理接口的 UDP DNS 主动探测。
 """
 
 from __future__ import annotations
 
 import base64
+import calendar
 import json
 import random
 import re
@@ -67,7 +70,7 @@ except Exception:  # noqa: BLE001
 # 常量
 # ---------------------------------------------------------------------------
 
-_UA = "MoviePilot-OpenClashMonitor/0.5.1"
+_UA = "MoviePilot-OpenClashMonitor/0.6.0"
 _SNAPSHOT_KEY = "snapshot"
 _NOTIFY_KEY = "notified_versions"
 _ALERT_KEY = "alert_state"
@@ -81,7 +84,7 @@ _ACTION_NAMES = {
     "restart": "重启 OpenClash",
     "rule": "切换规则模式",
     "node": "切换策略组节点",
-    "flush": "清理 DNS / Fake-IP 缓存",
+    "flush": "清理 DNS / Fake-IP 缓存（含 AtomDNS）",
     "flush_smart": "清理 Smart 缓存",
     "close": "关闭全部连接",
     "switch_config": "切换配置文件",
@@ -113,8 +116,12 @@ _BUILTIN_PROXIES = {
 # LocalDNS 查询日志里代表「该域名被拦截」的 domain_set 名称
 _BLOCKED_DOMAIN_SETS = {"adguard", "blocked", "blocked_aaaa", "blocked_qtype"}
 
+# AtomDNS 分流命中里代表「被拦截」的生效标签（rank/effective 的 key）
+_BLOCKED_EFFECTIVE_TAGS = ("黑名单", "广告屏蔽", "拦截")
+
 _DNS_MODE_OPTIONS = [
-    {"title": "LocalDNS（yyhoworks，推荐）", "value": "localdns"},
+    {"title": "AtomDNS（推荐，API 19100）", "value": "atomdns"},
+    {"title": "LocalDNS（旧版，API 19099）", "value": "localdns"},
     {"title": "AdGuard Home", "value": "adguard"},
     {"title": "关闭（只用内置 UDP 探测）", "value": "none"},
 ]
@@ -143,7 +150,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "luci_username": "",
     "luci_password": "",
     "luci_cookie": "",
-    "dns_mode": "localdns",
+    "dns_mode": "atomdns",
+    "at_url": "",
     "ld_url": "http://192.168.1.1:19099",
     "ld_github": True,
     "ag_url": "http://192.168.1.1:3000",
@@ -308,6 +316,73 @@ def _is_newer(latest: Any, current: Any) -> bool:
     return new > cur
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """把 AtomDNS 的 flags 值（bool / "true" / 1 等）转成布尔。"""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "enabled")
+
+
+def _host_of(url: str) -> str:
+    """从 URL 里取主机名（不含端口）。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        host = urllib.parse.urlsplit(text if "://" in text else f"http://{text}").hostname
+    except ValueError:
+        return ""
+    return str(host or "")
+
+
+def _iso_utc_to_local(stamp: Any) -> str:
+    """把 AtomDNS 返回的 UTC ISO 时间（2026-11-19T13:15:46.28Z）转成本地时间文本。"""
+    text = str(stamp or "").strip()
+    if not text:
+        return ""
+    match = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})", text)
+    if not match:
+        return text.replace("T", " ")[:19]
+    parts = [int(x) for x in match.groups()]
+    try:
+        utc_seconds = calendar.timegm(tuple(parts) + (0, 0, 0))
+        return datetime.fromtimestamp(utc_seconds).strftime("%m-%d %H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        return text.replace("T", " ")[:19]
+
+
+def _upstream_addr_key(addr: Any) -> str:
+    """把上游地址归一化，便于把 /metrics 的 ``udp://1.2.3.4`` 与配置里的 ``1.2.3.4`` 对上。"""
+    text = str(addr or "").strip().lower()
+    return re.sub(r"^(udp|tcp|tls|dot|quic|doq|h3)://", "", text)
+
+
+def _upstream_protocol(addr: str, hint: str = "", use_proxy: bool = False) -> str:
+    """把 AtomDNS 的上游地址归类成可读的协议名。"""
+    text = str(addr or "").strip().lower()
+    name = ""
+    if text.startswith("https://"):
+        name = "DoH"
+    elif text.startswith("tls://") or text.startswith("dot://"):
+        name = "DoT"
+    elif text.startswith("quic://") or text.startswith("doq://"):
+        name = "DoQ"
+    elif text.startswith("h3://"):
+        name = "DoH3"
+    elif text.startswith("udp://") or text.startswith("tcp://"):
+        name = "UDP" if text.startswith("udp://") else "TCP"
+    else:
+        name = {"https": "DoH", "doh": "DoH", "dot": "DoT", "tls": "DoT",
+                "udp": "UDP", "tcp": "TCP", "quic": "DoQ", "h3": "DoH3"}.get(str(hint).lower(), "")
+        if not name:
+            name = "UDP" if re.search(r":\d+$", text) else "-"
+    return f"{name}·代理" if use_proxy else name
+
+
 def _normalize_url(url: str, default_scheme: str = "http") -> str:
     """补全协议头并去掉尾部斜杠。"""
     text = str(url or "").strip()
@@ -367,6 +442,31 @@ def _payload_of(text: str) -> Any:
             except (ValueError, TypeError):
                 continue
     return body
+
+
+def _parse_metric_line(line: str) -> Tuple[str, Dict[str, str], str]:
+    """把一行 Prometheus 文本拆成 ``(指标名, 标签字典, 值)``。"""
+    text = str(line or "").strip()
+    if not text or text.startswith("#"):
+        return "", {}, ""
+    name_end = len(text)
+    for idx, char in enumerate(text):
+        if char in "{ ":
+            name_end = idx
+            break
+    name = text[:name_end]
+    rest = text[name_end:]
+    labels: Dict[str, str] = {}
+    if rest.startswith("{"):
+        end = rest.rfind("}")
+        if end < 0:
+            return name, {}, ""
+        for key, value in re.findall(r'(\w+)="((?:[^"\\]|\\.)*)"', rest[1:end]):
+            labels[key] = value
+        rest = rest[end + 1:]
+    tokens = rest.strip().split()
+    value = tokens[0] if tokens else ""
+    return name, labels, value
 
 
 # ---------------------------------------------------------------------------
@@ -638,15 +738,16 @@ def probe_dns(server: str, domain: str, timeout: float = 2.0) -> Dict[str, Any]:
 
 
 class OpenClashMonitor(_PluginBase):
-    """监控 OpenClash 与 LocalDNS 的运行状态。"""
+    """监控 OpenClash 与 AtomDNS（兼容旧版 LocalDNS / AdGuard Home）的运行状态。"""
 
     plugin_name = "OpenClash 监控"
     plugin_desc = (
         "集中监控 OpenClash 的运行状态与规则模式、代理组与节点延迟、订阅剩余流量与到期时间、"
-        "插件与内核版本更新，以及 LocalDNS 的查询统计、版本更新与上游 DNS 健康状态。"
+        "插件与内核版本更新，以及 AtomDNS（兼容旧版 LocalDNS / AdGuard Home）的查询统计、"
+        "分流命中、缓存命中、版本更新与上游 DNS 健康状态。"
     )
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "0.5.1"
+    plugin_version = "0.6.0"
     plugin_author = "zimo650"
     author_url = "https://github.com/zimo650"
     plugin_config_prefix = "openclashmonitor_"
@@ -665,6 +766,7 @@ class OpenClashMonitor(_PluginBase):
     _luci_password: str = ""
     _luci_cookie: str = ""
     _dns_mode: str = "none"
+    _at_url: str = ""
     _ld_url: str = ""
     _ld_github: bool = True
     _ag_url: str = ""
@@ -718,6 +820,7 @@ class OpenClashMonitor(_PluginBase):
         self._luci_password = str(merged.get("luci_password") or "")
         self._luci_cookie = str(merged.get("luci_cookie") or "").strip()
         self._dns_mode = str(merged.get("dns_mode") or "none").strip().lower()
+        self._at_url = _normalize_url(str(merged.get("at_url") or ""))
         self._ld_url = _normalize_url(str(merged.get("ld_url") or ""))
         self._ld_github = bool(merged.get("ld_github", True))
         self._ag_url = _normalize_url(str(merged.get("ag_url") or ""))
@@ -744,8 +847,25 @@ class OpenClashMonitor(_PluginBase):
         self._report_channels = self.__normalize_channels(merged.get("report_channels"))
         self._report_max_nodes = max(1, min(_safe_int(merged.get("report_max_nodes"), 5), 30))
 
+        # AtomDNS 地址留空时按路由器 / 旧 LocalDNS 地址推导（WebUI 与 API 同端口，默认 19100）
+        if not self._at_url:
+            host = _host_of(self._ld_url) or _host_of(self._luci_url)
+            if host:
+                self._at_url = f"http://{host}:19100"
+
         if not self._enabled:
             return
+
+        # 旧配置迁移：LocalDNS 已退役（19099 不再监听），探测到 AtomDNS 就自动切过来
+        if self._dns_mode == "localdns" and self._at_url and self.__atomdns_alive():
+            logger.info("OpenClash 监控：检测到 AtomDNS（%s），已从 LocalDNS 自动切换", self._at_url)
+            self._dns_mode = "atomdns"
+            merged["dns_mode"] = "atomdns"
+            merged["at_url"] = self._at_url
+            try:
+                self.update_config(merged)
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"OpenClash 监控：回写 AtomDNS 配置失败 {err}")
 
         # 配置里的「立即运行一次」只在保存时生效一次
         if onlyonce:
@@ -1024,7 +1144,7 @@ class OpenClashMonitor(_PluginBase):
                 "endpoint": self.api_dns,
                 "methods": ["GET"],
                 "auth": "bear",
-                "summary": "获取 LocalDNS 状态、上游健康与查询日志",
+                "summary": "获取 AtomDNS 状态、上游健康与查询日志",
             },
             {
                 "path": "/probe",
@@ -1255,33 +1375,43 @@ class OpenClashMonitor(_PluginBase):
                         "component": "VRow",
                         "content": [
                             self.__form_col(4, {"component": "VSelect",
-                                                "props": {"model": "dns_mode", "label": "LocalDNS 类型",
+                                                "props": {"model": "dns_mode", "label": "DNS 监控程序",
                                                           "items": _DNS_MODE_OPTIONS,
-                                                          "hint": "按路由器上实际运行的 DNS 程序选择",
+                                                          "hint": "按路由器上实际运行的 DNS 程序选择；AtomDNS 是当前推荐",
                                                           "persistentHint": True}}),
                             self.__form_col(6, {"component": "VTextField",
-                                                "props": {"model": "ld_url", "label": "LocalDNS 地址",
-                                                          "placeholder": "http://192.168.1.1:19099",
+                                                "props": {"model": "at_url", "label": "AtomDNS 地址",
+                                                          "placeholder": "http://192.168.1.1:19100",
                                                           "persistentHint": True,
-                                                          "hint": "LocalDNS 的 API 端口（默认 19099）"}}),
+                                                          "hint": "AtomDNS 的 WebUI/API 端口（默认 19100）；留空时按路由器地址自动拼 :19100"}}),
                             self.__form_col(2, {"component": "VSwitch",
                                                 "props": {"model": "ld_github",
-                                                          "label": "查 GitHub 版本"}}),
+                                                          "label": "在线查版本"}}),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__form_col(6, {"component": "VTextField",
+                                                "props": {"model": "ld_url", "label": "LocalDNS 地址（旧版）",
+                                                          "placeholder": "http://192.168.1.1:19099",
+                                                          "persistentHint": True,
+                                                          "hint": "LocalDNS 已于 2026-11 退役；仍在使用 19099 时才需要填"}}),
+                            self.__form_col(6, {"component": "VTextField",
+                                                "props": {"model": "ag_url", "label": "AdGuard Home 地址",
+                                                          "placeholder": "http://192.168.1.1:3000"}}),
                         ],
                     },
                     {
                         "component": "VRow",
                         "content": [
                             self.__form_col(4, {"component": "VTextField",
-                                                "props": {"model": "ag_url", "label": "AdGuard Home 地址",
-                                                          "placeholder": "http://192.168.1.1:3000"}}),
-                            self.__form_col(3, {"component": "VTextField",
                                                 "props": {"model": "ag_username", "label": "AdGuard 用户名",
                                                           "placeholder": "admin"}}),
-                            self.__form_col(3, {"component": "VTextField",
+                            self.__form_col(4, {"component": "VTextField",
                                                 "props": {"model": "ag_password", "label": "AdGuard 密码",
                                                           "type": "password"}}),
-                            self.__form_col(2, {"component": "VSwitch",
+                            self.__form_col(4, {"component": "VSwitch",
                                                 "props": {"model": "ag_test_upstream",
                                                           "label": "上游测速"}}),
                         ],
@@ -1925,6 +2055,7 @@ class OpenClashMonitor(_PluginBase):
 
         dns_current = str(dns_view.get("version") or "")
         dns_latest = str(dns_view.get("latest_version") or "")
+        dns_provider = str(dns_view.get("provider") or "")
 
         def _differs(latest_text: str, current_text: str) -> bool:
             """有数字版本号时按版本比较，否则退化成字符串比对。"""
@@ -1944,6 +2075,9 @@ class OpenClashMonitor(_PluginBase):
             "core_update": _differs(core_latest, core_current),
             "dns_current": dns_current,
             "dns_latest": dns_latest,
+            "dns_provider": dns_provider,
+            "dns_label": {"atomdns": "AtomDNS", "localdns": "LocalDNS",
+                          "adguard": "AdGuard Home"}.get(dns_provider, "DNS"),
             "dns_update": bool(dns_view.get("update_available")) or _differs(dns_latest, dns_current),
             "dns_source": str(dns_view.get("latest_source") or ""),
             "dns_error": str(dns_view.get("remote_error") or ""),
@@ -1991,8 +2125,19 @@ class OpenClashMonitor(_PluginBase):
                 "hosts": bool(dns_cfg.get("use-hosts")),
             }
 
+        if self._dns_mode == "atomdns":
+            return self.__collect_atomdns(view, errors)
+
         if self._dns_mode == "localdns":
-            return self.__collect_localdns(view, errors)
+            local_view, local_errors = self.__collect_localdns(dict(view), [])
+            if local_view.get("ok") or not self._at_url:
+                return local_view, errors + local_errors
+            # LocalDNS 已于 2026-11 退役：确认不可达时自动改用 AtomDNS
+            if not self.__atomdns_alive():
+                return local_view, errors + local_errors
+            fallback_view, fallback_errors = self.__collect_atomdns(dict(view), [])
+            fallback_view["fallback_note"] = "LocalDNS 不可达（已退役），本次已自动改用 AtomDNS"
+            return fallback_view, errors + fallback_errors
 
         if self._dns_mode != "adguard":
             return view, errors
@@ -2216,9 +2361,533 @@ class OpenClashMonitor(_PluginBase):
 
         return view, errors
 
+    # ------------------------------------------------------------------
+    # 采集：AtomDNS（当前主用；WebUI 与 API 同端口，默认 19100）
+    # ------------------------------------------------------------------
+
+    def __atomdns_alive(self) -> bool:
+        """探测 AtomDNS 是否在监听（只在自动迁移 / 回退时调用）。"""
+        if not self._at_url:
+            return False
+        doc, err = self.__at_get("/api/v1/system/health",
+                                 timeout=min(3.0, max(1.5, self._timeout)))
+        return err is None and isinstance(doc, dict) and bool(doc.get("version") or doc.get("state"))
+
+    def __collect_atomdns(self, view: Dict[str, Any], errors: List[str]) -> Tuple[Dict[str, Any], List[str]]:
+        """采集 AtomDNS（github.com/jasonxtt/atomdns）的状态、分流、上游、查询与版本。"""
+        view["provider"] = "atomdns"
+        if not self._at_url:
+            view["error"] = "未配置 AtomDNS 地址"
+            errors.append("AtomDNS：未配置 AtomDNS 地址")
+            return view, errors
+
+        health_doc, err = self.__at_get("/api/v1/system/health")
+        if err:
+            view["error"] = err
+            errors.append(f"AtomDNS 状态：{err}")
+            return view, errors
+        health = health_doc if isinstance(health_doc, dict) else {}
+        state = str(health.get("state") or "")
+        view["ok"] = bool(health.get("ready")) or state in ("ready", "running")
+        view["running"] = view["ok"]
+        view["state"] = state or ("ready" if view["ok"] else "")
+        view["version"] = str(health.get("version") or "")
+        view["runtime"] = str(health.get("runtime") or "")
+        view["core_version"] = view["runtime"]
+        view["config_schema"] = _safe_int(health.get("applied_config_schema"), 0)
+        view["api_listen"] = urllib.parse.urlsplit(self._at_url).netloc or self._at_url
+        for item in health.get("external_ui") or []:
+            if isinstance(item, dict) and item.get("mounted"):
+                view["ui_version"] = str(item.get("ui_version") or "")
+                view["built_at"] = str(item.get("built_at") or "")
+                view["channel"] = str(item.get("kind") or "")
+                break
+        listens = [str(x.get("listen") or "") for x in (health.get("udp_receive_buffers") or [])
+                   if isinstance(x, dict) and x.get("listen")]
+        view["listen"] = "、".join(listens)
+
+        # 分流开关：dns_mode（fakeip / realip）、核心模式、各类屏蔽开关
+        flags_doc, _flags_err = self.__at_get("/api/v1/flags")
+        flags: Dict[str, Any] = {}
+        raw_flags = flags_doc.get("flags") if isinstance(flags_doc, dict) else None
+        if isinstance(raw_flags, list):
+            for item in raw_flags:
+                if isinstance(item, dict) and item.get("key"):
+                    flags[str(item["key"])] = item.get("value")
+        view["flags"] = flags
+        view["mode"] = str(flags.get("dns_mode") or "")
+        view["mode_text"] = {"fakeip": "FakeIP 分流", "realip": "RealIP 分流"}.get(
+            view["mode"], view["mode"] or "-")
+        view["core_mode"] = str(flags.get("core_mode") or "")
+        view["core_mode_text"] = {"compat": "兼容模式", "safe": "安全模式"}.get(
+            view["core_mode"], view["core_mode"] or "-")
+        view["cn_fakeip"] = _as_bool(flags.get("cn_fakeip"))
+        view["block_blocklist"] = _as_bool(flags.get("block_blocklist"))
+        view["block_ads"] = _as_bool(flags.get("block_ads"))
+        view["block_aaaa"] = _as_bool(flags.get("block_aaaa"))
+        view["full_cache"] = _as_bool(flags.get("full_cache"))
+
+        # 上游分组与地址（/upstream/groups 给激活状态，/upstream/config 给具体地址）
+        groups_doc, groups_err = self.__at_get("/api/v1/upstream/groups")
+        if groups_err:
+            errors.append(f"AtomDNS 上游分组：{groups_err}")
+        config_doc, config_err = self.__at_get("/api/v1/upstream/config")
+        if config_err:
+            errors.append(f"AtomDNS 上游配置：{config_err}")
+        meta: Dict[str, Dict[str, Any]] = {}
+        if isinstance(groups_doc, list):
+            meta = {str(g.get("tag")): g for g in groups_doc
+                    if isinstance(g, dict) and g.get("tag")}
+        entries_by_group: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(config_doc, dict):
+            for group, entries in config_doc.items():
+                if isinstance(entries, list):
+                    entries_by_group[str(group)] = [e for e in entries if isinstance(e, dict)]
+        ordered_groups = [tag for tag in meta if tag in entries_by_group]
+        ordered_groups += [tag for tag in entries_by_group if tag not in meta]
+        groups: List[Dict[str, Any]] = []
+        for tag in ordered_groups:
+            entries = entries_by_group.get(tag) or []
+            info = meta.get(tag) or {}
+            enabled = sum(1 for e in entries if e.get("enabled") is not False)
+            groups.append({
+                "name": tag,
+                "count": len(entries),
+                "enabled": enabled,
+                "active": _as_bool(info.get("active"), True),
+                "reason": str(info.get("inactive_reason") or ""),
+                "when": str(info.get("used_when") or ""),
+            })
+        view["upstream_groups"] = groups
+
+        # /metrics：进程指标 + 各上游累计请求/错误/延迟 + 各缓存命中
+        metrics = self.__at_metrics()
+        cache = metrics.get("cache") if isinstance(metrics.get("cache"), dict) else {}
+        if cache:
+            view["cache_hit"] = _safe_int(cache.get("hit"), 0)
+            view["cache_query"] = _safe_int(cache.get("query"), 0)
+            view["cache_lazy_hit"] = _safe_int(cache.get("lazy_hit"), 0)
+            view["cache_entries"] = _safe_int(cache.get("size"), 0)
+            if view["cache_query"] > 0:
+                view["cache_hit_percent"] = round(view["cache_hit"] * 100.0 / view["cache_query"], 2)
+        for key in ("cpu_percent", "mem_bytes", "uptime_seconds", "upstream_queries", "upstream_errors"):
+            if metrics.get(key) is not None:
+                view[key] = metrics[key]
+
+        samples = metrics.get("upstreams") if isinstance(metrics.get("upstreams"), list) else []
+        sample_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        sample_by_addr: Dict[str, Dict[str, Any]] = {}
+        for row in samples:
+            if not isinstance(row, dict):
+                continue
+            addr_key = _upstream_addr_key(row.get("addr"))
+            sample_by_key[(addr_key, str(row.get("group")), str(row.get("tag")))] = row
+            sample_by_addr.setdefault(addr_key, row)
+
+        health_rows: List[Dict[str, Any]] = []
+        latency_sum = 0.0
+        latency_count = 0
+        for tag in ordered_groups:
+            for entry in entries_by_group.get(tag) or []:
+                addr = str(entry.get("addr") or "")
+                up_tag = str(entry.get("tag") or "")
+                sample = sample_by_key.get((_upstream_addr_key(addr), tag, up_tag)) \
+                    or sample_by_addr.get(_upstream_addr_key(addr)) or {}
+                requests_n = _safe_int(sample.get("requests"), 0)
+                errors_n = _safe_int(sample.get("errors"), 0)
+                l_sum = _safe_float(sample.get("latency_sum"), 0.0)
+                l_cnt = _safe_int(sample.get("latency_count"), 0)
+                latency_sum += l_sum
+                latency_count += l_cnt
+                avg = round(l_sum / l_cnt, 1) if l_cnt > 0 else None
+                # 历史累计里偶发 1~2 次失败不算异常，只有失败率 ≥1% 或 ≥3 次才标红
+                fail_rate = errors_n / requests_n if requests_n > 0 else 0.0
+                if errors_n == 0:
+                    row_state = "ok" if requests_n > 0 else "idle"
+                elif fail_rate >= 0.01 or errors_n >= 3:
+                    row_state = "error"
+                else:
+                    row_state = "warn"
+                health_rows.append({
+                    "server": addr,
+                    "group": tag,
+                    "tag": up_tag,
+                    "protocol": _upstream_protocol(addr, str(entry.get("protocol") or ""),
+                                                   _as_bool(entry.get("use_socks_proxy"))),
+                    "requests": requests_n,
+                    "accepted": _safe_int(sample.get("winners"), 0),
+                    "errors": errors_n,
+                    "timeouts": 0,
+                    "winners": _safe_int(sample.get("winners"), 0),
+                    "latency_ms": avg,
+                    "ok": row_state == "ok",
+                    "state": row_state,
+                    "enabled": entry.get("enabled") is not False,
+                    "error": "",
+                })
+        if latency_count > 0:
+            view["avg_ms"] = round(latency_sum / latency_count, 2)
+        view["upstream_health"] = health_rows
+        view["upstreams"] = [row["server"] for row in health_rows if row["server"]]
+
+        # 查询量 / 平均耗时 / 分流命中（审计接口）
+        stats_doc, stats_err = self.__at_get("/api/v2/audit/stats")
+        if stats_err:
+            view["audit_error"] = stats_err
+        elif isinstance(stats_doc, dict):
+            view["queries"] = _safe_int(stats_doc.get("total_queries"), 0)
+            q_avg = _safe_float(stats_doc.get("average_duration_ms"), -1.0)
+            if q_avg >= 0:
+                view["query_avg_ms"] = round(q_avg, 2)
+        windows_doc, _windows_err = self.__at_get("/api/v2/audit/stats/windows")
+        if isinstance(windows_doc, dict):
+            windows: Dict[str, Dict[str, Any]] = {}
+            for item in windows_doc.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key") or "")
+                if not key:
+                    continue
+                windows[key] = {
+                    "count": _safe_int(item.get("request_count"), 0),
+                    "avg_ms": round(_safe_float(item.get("average_duration_ms"), 0.0), 2),
+                    "complete": bool(item.get("complete")),
+                }
+                if item.get("coverage_start"):
+                    view["coverage_start"] = str(item.get("coverage_start"))
+            view["windows"] = windows
+            if windows.get("24h"):
+                view["q24"] = windows["24h"]["count"]
+            if windows.get("1h"):
+                view["q1"] = windows["1h"]["count"]
+
+        rank_doc, rank_err = self.__at_get("/api/v2/audit/rank/effective", {"limit": 30})
+        if isinstance(rank_doc, list):
+            rank = [{"name": str(x.get("key") or ""), "count": _safe_int(x.get("count"), 0)}
+                    for x in rank_doc if isinstance(x, dict) and x.get("key")]
+            rank_total = sum(x["count"] for x in rank)
+            blocked = sum(x["count"] for x in rank
+                          if any(t in x["name"] for t in _BLOCKED_EFFECTIVE_TAGS))
+            view["rank"] = rank
+            view["rank_total"] = rank_total
+            view["blocked"] = blocked
+            if rank_total > 0:
+                view["blocked_percent"] = round(blocked * 100.0 / rank_total, 2)
+        elif rank_err:
+            view["rank_error"] = rank_err
+
+        domains_doc, _domains_err = self.__at_get("/api/v2/audit/rank/domain", {"limit": 10})
+        if isinstance(domains_doc, list):
+            view["top_domains"] = [{"name": str(x.get("key") or ""),
+                                    "count": _safe_int(x.get("count"), 0)}
+                                   for x in domains_doc if isinstance(x, dict) and x.get("key")][:10]
+        clients_doc, _clients_err = self.__at_get("/api/v2/audit/rank/client", {"limit": 10})
+        if isinstance(clients_doc, list):
+            view["top_clients"] = [{"name": str(x.get("key") or ""),
+                                    "count": _safe_int(x.get("count"), 0)}
+                                   for x in clients_doc if isinstance(x, dict) and x.get("key")][:10]
+        slow_doc, _slow_err = self.__at_get("/api/v2/audit/rank/slowest", {"limit": 5})
+        if isinstance(slow_doc, list):
+            view["slowest"] = [{"domain": str(x.get("query_name") or "-"),
+                                "client": str(x.get("client_ip") or "-"),
+                                "ms": round(_safe_float(x.get("duration_ms"), 0.0), 1),
+                                "code": str(x.get("response_code") or "")}
+                               for x in slow_doc if isinstance(x, dict)][:5]
+
+        # 查询日志（同时抽样统计热门域名与近期拦截数）
+        if self._querylog_limit > 0:
+            log_doc, log_err = self.__at_get("/api/v2/audit/logs",
+                                             {"page": 1, "limit": max(self._querylog_limit, 50)})
+            if log_err:
+                errors.append(f"AtomDNS 查询日志：{log_err}")
+            elif isinstance(log_doc, dict):
+                raw_logs = log_doc.get("logs") if isinstance(log_doc.get("logs"), list) else []
+                view["querylog"] = self.__atomdns_querylog(raw_logs, self._querylog_limit)
+                view["sampled"] = len(raw_logs)
+                view["blocked_recent"] = sum(1 for row in view["querylog"]
+                                             if row.get("status") == "拦截")
+                pagination = log_doc.get("pagination") if isinstance(log_doc.get("pagination"), dict) else {}
+                view["audit_total"] = _safe_int(pagination.get("total_items"), view.get("queries") or 0)
+                if not view.get("top_domains"):
+                    counters: Dict[str, int] = {}
+                    for entry in raw_logs:
+                        if isinstance(entry, dict):
+                            name = str(entry.get("query_name") or "")
+                            if name:
+                                counters[name] = counters.get(name, 0) + 1
+                    top = sorted(counters.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    view["top_domains"] = [{"name": name, "count": count} for name, count in top]
+
+        # 定时刷新与路由记忆
+        requery_doc, _rq_err = self.__at_get("/plugins/requery/status")
+        if isinstance(requery_doc, dict):
+            view["requery"] = {
+                "state": str(requery_doc.get("task_state") or ""),
+                "last_start": _iso_utc_to_local(requery_doc.get("last_run_start_time")),
+                "last_end": _iso_utc_to_local(requery_doc.get("last_run_end_time")),
+                "domains": _safe_int(requery_doc.get("last_run_domain_count"), 0),
+            }
+        learner_doc, _rl_err = self.__at_get("/plugins/route_learner/status")
+        if isinstance(learner_doc, dict):
+            categories = [c for c in (learner_doc.get("categories") or []) if isinstance(c, dict)]
+            view["memory_entries"] = sum(_safe_int(c.get("entries"), 0) for c in categories)
+            view["memory_counters"] = learner_doc.get("counters") if isinstance(learner_doc.get("counters"), dict) else {}
+            view["memory_categories"] = [{"name": str(c.get("label") or c.get("tag") or ""),
+                                          "count": _safe_int(c.get("entries"), 0)}
+                                         for c in categories if _safe_int(c.get("entries"), 0) > 0][:5]
+
+        # 版本更新：优先程序自带的更新检查，失败再退回 GitHub Releases API
+        update_doc, _update_err = self.__at_get("/api/v1/update/status")
+        if isinstance(update_doc, dict):
+            view["version"] = view["version"] or str(update_doc.get("current_version") or "")
+            view["latest_version"] = str(update_doc.get("latest_version") or "")
+            view["update_available"] = bool(update_doc.get("update_available"))
+            view["release_url"] = str(update_doc.get("release_url") or "")
+            view["latest_asset"] = str(update_doc.get("asset_name") or "")
+            view["latest_published"] = str(update_doc.get("published_at") or "")
+            view["update_message"] = str(update_doc.get("message") or "")
+            if view["latest_version"]:
+                view["latest_source"] = "atomdns-self"
+            checked_at = _iso_utc_to_local(update_doc.get("checked_at"))
+            if checked_at:
+                view["update_checked_at"] = checked_at
+        if not view.get("latest_version") and self._ld_github:
+            checked, _check_err = self.__at_request("POST", "/api/v1/update/check", body={})
+            if checked is not None:
+                update_doc2, _ = self.__at_get("/api/v1/update/status")
+                if isinstance(update_doc2, dict) and update_doc2.get("latest_version"):
+                    view["latest_version"] = str(update_doc2.get("latest_version"))
+                    view["release_url"] = str(update_doc2.get("release_url") or "")
+                    view["latest_asset"] = str(update_doc2.get("asset_name") or "")
+                    view["latest_published"] = str(update_doc2.get("published_at") or "")
+                    view["update_message"] = str(update_doc2.get("message") or "")
+                    view["latest_source"] = "atomdns-self"
+            if not view.get("latest_version"):
+                latest_info, cues = self.__at_remote_version()
+                if latest_info:
+                    view["latest_version"] = str(latest_info.get("version") or "")
+                    view["latest_asset"] = str(latest_info.get("asset") or "")
+                    view["latest_published"] = str(latest_info.get("published_at") or "")
+                    view["latest_source"] = str(latest_info.get("source") or "")
+                else:
+                    # 版本查询失败只做提示（写在版本卡的说明里），不算采集异常
+                    view["remote_error"] = "；".join(cues)[:240]
+        if view.get("latest_version") and view.get("version"):
+            view["update_available"] = _is_newer(view["latest_version"], view["version"])
+        return view, errors
+
+    def __at_get(self, path: str, params: Optional[Dict[str, Any]] = None,
+                 timeout: Optional[float] = None) -> Tuple[Any, Optional[str]]:
+        """请求 AtomDNS API（无鉴权，WebUI 与 API 同端口）。"""
+        return self.__at_request("GET", path, params=params, timeout=timeout)
+
+    def __at_request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None,
+                     body: Any = None, timeout: Optional[float] = None) -> Tuple[Any, Optional[str]]:
+        """请求 AtomDNS API，返回 ``(data, error)``。"""
+        if not self._at_url:
+            return None, "未配置 AtomDNS 地址"
+        result = http_request(
+            method,
+            self._at_url + path,
+            headers={"Accept": "application/json"},
+            params=params,
+            body=body,
+            timeout=timeout or self._timeout,
+        )
+        if result["error"] and result["status"] is None:
+            return None, str(result["error"])
+        if result["status"] and result["status"] >= 400:
+            return None, f"HTTP {result['status']}"
+        return result["data"], None
+
+    def __at_metrics(self) -> Dict[str, Any]:
+        """读两次 /metrics：算进程 CPU，并汇总各上游与各缓存的累计指标。"""
+        if not self._at_url:
+            return {}
+        first = http_request("GET", self._at_url + "/metrics", timeout=self._timeout)
+        text_first = str(first.get("text") or "")
+        if first["status"] != 200 or "process_cpu_seconds_total" not in text_first:
+            return {}
+        sample1 = self.__parse_atomdns_metrics(text_first)
+        started = time.monotonic()
+        time.sleep(0.3)
+        second = http_request("GET", self._at_url + "/metrics", timeout=self._timeout)
+        sample2 = self.__parse_atomdns_metrics(str(second.get("text") or "")) \
+            if second["status"] == 200 else {}
+        elapsed = max(0.1, time.monotonic() - started)
+
+        result: Dict[str, Any] = {}
+        cpu1 = _safe_float(sample1.get("cpu_seconds"), -1.0)
+        cpu2 = _safe_float(sample2.get("cpu_seconds"), -1.0)
+        if cpu1 >= 0 and cpu2 >= cpu1:
+            result["cpu_percent"] = round(min((cpu2 - cpu1) / elapsed * 100.0, 100.0), 1)
+        mem = _safe_int(sample1.get("resident_bytes"), 0)
+        if mem > 0:
+            result["mem_bytes"] = mem
+        start_time = _safe_int(sample1.get("start_time"), 0)
+        if start_time > 0:
+            result["uptime_seconds"] = max(0, int(time.time() - start_time))
+
+        upstreams = list((sample1.get("upstreams") or {}).values())
+        result["upstreams"] = upstreams
+        result["upstream_queries"] = sum(_safe_int(row.get("requests"), 0) for row in upstreams)
+        result["upstream_errors"] = sum(_safe_int(row.get("errors"), 0) for row in upstreams)
+
+        caches = sample1.get("caches") or {}
+        aggregate = {"query": 0, "hit": 0, "lazy_hit": 0, "size": 0}
+        for values in caches.values():
+            for key in aggregate:
+                aggregate[key] += _safe_int(values.get(key), 0)
+        result["cache"] = aggregate
+        return result
+
+    @staticmethod
+    def __parse_atomdns_metrics(text: str) -> Dict[str, Any]:
+        """解析 AtomDNS 的 Prometheus 文本：进程指标、上游计数与缓存命中。"""
+        values: Dict[str, Any] = {"upstreams": {}, "caches": {}}
+        upstreams: Dict[Tuple[str, str, str], Dict[str, Any]] = values["upstreams"]
+        caches: Dict[str, Dict[str, Any]] = values["caches"]
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, labels, value = _parse_metric_line(line)
+            if not name:
+                continue
+            number = _safe_float(value, 0.0)
+            if name == "process_cpu_seconds_total":
+                values["cpu_seconds"] = number
+            elif name == "process_resident_memory_bytes":
+                values["resident_bytes"] = number
+            elif name == "process_start_time_seconds":
+                values["start_time"] = number
+            elif name.startswith("atomdns_aliapi_"):
+                key = (str(labels.get("addr") or ""), str(labels.get("metrics_tag") or ""),
+                       str(labels.get("tag") or ""))
+                row = upstreams.setdefault(key, {"addr": key[0], "group": key[1], "tag": key[2],
+                                                 "requests": 0, "errors": 0, "winners": 0,
+                                                 "latency_sum": 0.0, "latency_count": 0})
+                if name == "atomdns_aliapi_query_total":
+                    row["requests"] = _safe_int(number, 0)
+                elif name == "atomdns_aliapi_error_total":
+                    row["errors"] = _safe_int(number, 0)
+                elif name == "atomdns_aliapi_upstream_winner_total":
+                    row["winners"] = _safe_int(number, 0)
+                elif name == "atomdns_aliapi_response_latency_millisecond_sum":
+                    row["latency_sum"] = number
+                elif name == "atomdns_aliapi_response_latency_millisecond_count":
+                    row["latency_count"] = _safe_int(number, 0)
+            elif name.startswith("atomdns_cache_"):
+                tag = str(labels.get("tag") or "")
+                if not tag:
+                    continue
+                row = caches.setdefault(tag, {"tag": tag, "query": 0, "hit": 0,
+                                              "lazy_hit": 0, "size": 0})
+                if name == "atomdns_cache_query_total":
+                    row["query"] = _safe_int(number, 0)
+                elif name == "atomdns_cache_hit_total":
+                    row["hit"] = _safe_int(number, 0)
+                elif name == "atomdns_cache_lazy_hit_total":
+                    row["lazy_hit"] = _safe_int(number, 0)
+                elif name == "atomdns_cache_size_current":
+                    row["size"] = _safe_int(number, 0)
+        return values
+
+    @staticmethod
+    def __atomdns_querylog(raw: Any, limit: int) -> List[Dict[str, Any]]:
+        """整理 AtomDNS 的审计日志条目。"""
+        items: List[Dict[str, Any]] = []
+        if not isinstance(raw, list):
+            return items
+        for entry in raw[: max(1, limit)]:
+            if not isinstance(entry, dict):
+                continue
+            effective = str(entry.get("effective_tag") or "")
+            domain_set = str(entry.get("domain_set") or "")
+            source = str(entry.get("matched_rule_source") or "")
+            code = str(entry.get("response_code") or "")
+            blocked = (any(tag in effective for tag in _BLOCKED_EFFECTIVE_TAGS)
+                       or any(tag in domain_set for tag in _BLOCKED_EFFECTIVE_TAGS)
+                       or ("blocklist" in source and code in ("NXDOMAIN", "REFUSED"))
+                       or ("adguard" in source and code in ("NXDOMAIN", "REFUSED")))
+            answers = entry.get("answers") if isinstance(entry.get("answers"), list) else []
+            result_text = code or "-"
+            if answers:
+                head = answers[0]
+                result_text = f"{code} → {head}" if code else str(head)
+            duration = _safe_float(entry.get("duration_ms"), -1.0)
+            items.append({
+                "time": _iso_utc_to_local(entry.get("query_time")),
+                "domain": str(entry.get("query_name") or "-"),
+                "type": str(entry.get("query_type") or "-"),
+                "client": str(entry.get("client_ip") or "-"),
+                "status": "拦截" if blocked else "放行",
+                "elapsed": round(duration, 1) if duration >= 0 else None,
+                "result": result_text,
+                "tag": effective or domain_set or "-",
+            })
+        return items
+
+    def __at_remote_version(self) -> Tuple[Dict[str, Any], List[str]]:
+        """GitHub 兜底查 AtomDNS 最新版（程序自带检查失败时用）。"""
+        cues: List[str] = []
+        timeout = max(self._timeout, 12)
+        api_url = "https://api.github.com/repos/jasonxtt/atomdns/releases/latest"
+        result = http_request(
+            "GET", api_url,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": _UA},
+            timeout=timeout,
+        )
+        doc = _json_or_none(result.get("data")) or _json_or_none(result.get("text"))
+        tag = str(doc.get("tag_name") or "").strip() if isinstance(doc, dict) else ""
+        if tag:
+            asset = ""
+            for item in doc.get("assets") or []:
+                name = str(item.get("name") or "") if isinstance(item, dict) else ""
+                if "musl" in name and "amd64" in name:
+                    asset = name
+                    break
+            return {
+                "version": tag,
+                "asset": asset,
+                "published_at": str(doc.get("published_at") or ""),
+                "source": "github-api",
+            }, cues
+        cues.append(f"GitHub API 失败（{result.get('error') or 'HTTP ' + str(result.get('status'))}）")
+        return {}, cues
+
+    def __flush_atomdns_caches(self) -> Dict[str, Any]:
+        """清理 AtomDNS 的六个缓存（切分流模式后必须清，否则老答案会多活 7 天）。"""
+        if not self._at_url:
+            return {}
+        inventory, err = self.__at_get("/api/v1/cache/inventory")
+        tags: List[str] = []
+        if isinstance(inventory, dict):
+            tags = [str(item.get("tag")) for item in (inventory.get("caches") or [])
+                    if isinstance(item, dict) and item.get("tag")]
+        if not tags:
+            tags = ["cache_all", "cache_all_noleak", "cache_cn", "cache_google",
+                    "cache_google_node", "cache_cnmihomo"]
+        flushed: List[str] = []
+        failed: List[str] = []
+        for tag in tags:
+            data, flush_err = self.__at_request(
+                "POST", f"/plugins/{urllib.parse.quote(tag)}/flush", body={},
+                timeout=max(2.0, min(self._timeout, 6.0)))
+            if flush_err is None:
+                flushed.append(tag)
+            else:
+                failed.append(f"{tag}({flush_err})")
+        detail: Dict[str, Any] = {"flushed": flushed}
+        if failed:
+            detail["failed"] = failed
+        if err and not flushed:
+            detail["error"] = err
+        return detail
+
     def __ld_get(self, path: str, params: Optional[Dict[str, Any]] = None,
                  timeout: Optional[float] = None) -> Tuple[Any, Optional[str]]:
-        """请求 LocalDNS API。"""
+        """请求 LocalDNS API（旧版，已退役，保留用于历史环境）。"""
         if not self._ld_url:
             return None, "未配置 LocalDNS 地址"
         result = http_request(
@@ -2775,7 +3444,8 @@ class OpenClashMonitor(_PluginBase):
                 lines.append("· " + "，".join(piece for piece in pieces if piece))
 
         version_lines: List[str] = []
-        for label, prefix in (("插件", "plugin"), ("内核", "core"), ("LocalDNS", "dns")):
+        for label, prefix in (("插件", "plugin"), ("内核", "core"),
+                              (str(versions.get("dns_label") or "DNS"), "dns")):
             current = str(versions.get(f"{prefix}_current") or "")
             latest = str(versions.get(f"{prefix}_latest") or "")
             if not current:
@@ -2791,21 +3461,33 @@ class OpenClashMonitor(_PluginBase):
 
         if dns and str(dns.get("provider") or "") not in ("", "none"):
             lines.append("")
+            provider = str(dns.get("provider") or "")
+            provider_name = {"atomdns": "AtomDNS", "localdns": "LocalDNS（旧版）",
+                             "adguard": "AdGuard Home"}.get(provider, "DNS")
             scope: List[str] = []
-            if dns.get("core_version"):
-                scope.append(str(dns["core_version"]))
-            if dns.get("ui_version"):
-                scope.append(str(dns["ui_version"]))
-            head = "LocalDNS" + (" " + " / ".join(scope) if scope else "")
+            for key in ("version", "core_version", "mode_text"):
+                if dns.get(key):
+                    scope.append(str(dns[key]))
+            head = provider_name + (" " + " / ".join(scope) if scope else "")
             if dns.get("queries") is not None:
                 head += f"，查询 {_safe_int(dns.get('queries'))}，拦截 {_safe_float(dns.get('blocked_percent')):g}%"
+            if dns.get("cache_hit_percent") is not None:
+                head += f"，缓存命中 {_safe_float(dns.get('cache_hit_percent')):g}%"
             lines.append(head)
+            if dns.get("q24") is not None:
+                lines.append(f"24 小时查询 {_safe_int(dns.get('q24'))} 次，"
+                             f"平均 {_safe_float(dns.get('query_avg_ms')):g} ms")
             health = [item for item in (dns.get("upstream_health") or []) if isinstance(item, dict)]
-            bad = [item for item in health if not item.get("ok")]
+            bad = [item for item in health
+                   if str(item.get("state") or ("ok" if item.get("ok") else "error")) == "error"]
+            warn = [item for item in health
+                    if str(item.get("state") or "") == "warn"]
             if health:
-                lines.append(f"上游 {len(health)} 个，异常 {len(bad)} 个")
+                tail = f"（另有 {len(warn)} 个轻微失败）" if warn else ""
+                lines.append(f"上游 {len(health)} 个，异常 {len(bad)} 个{tail}")
                 for item in bad[:3]:
-                    lines.append(f"· {item.get('server')}（{item.get('group')}）失败 {_safe_int(item.get('errors')) + _safe_int(item.get('timeouts'))} 次")
+                    lines.append(f"· {item.get('server')}（{item.get('group') or '默认'}）"
+                                 f"失败 {_safe_int(item.get('errors')) + _safe_int(item.get('timeouts'))} 次")
             probes = [item for item in (snapshot.get("probe") or []) if isinstance(item, dict)]
             if probes:
                 summary = "、".join(
@@ -2946,13 +3628,26 @@ class OpenClashMonitor(_PluginBase):
         if name in ("flush", "flush_smart"):
             luci_action = "flush_dns_cache" if name == "flush" else "flush_smart_cache"
             data, err = self.__luci_post(luci_action, {})
-            if err:
-                return {"action": name, "ok": False, "message": f"{_ACTION_NAMES[name]}失败", "detail": err}
-            detail: Dict[str, Any] = {"luci": data}
+            detail: Dict[str, Any] = {"luci": data if not err else err}
+            notes: List[str] = ["LuCI 已清理" if not err else f"LuCI {err}"]
             if name == "flush":
                 ok, clash_err = self.__clash_send("POST", "/cache/dns/flush", {})
                 detail["clash"] = "已清理" if ok else clash_err
-            return {"action": name, "ok": True, "message": f"已提交{_ACTION_NAMES[name]}", "detail": detail}
+                notes.append("Clash 已清理" if ok else f"Clash {clash_err}")
+                # AtomDNS 有六层缓存，切分流模式后必须一起清，否则老答案会多活 7 天
+                atomdns_detail = self.__flush_atomdns_caches()
+                if atomdns_detail:
+                    detail["atomdns"] = atomdns_detail
+                    flushed = [str(tag) for tag in (atomdns_detail.get("flushed") or [])]
+                    if flushed:
+                        notes.append(f"AtomDNS {len(flushed)} 个缓存已清")
+                    if atomdns_detail.get("failed"):
+                        notes.append("AtomDNS 部分失败：" + "、".join(atomdns_detail["failed"][:3]))
+            atomdns_ok = bool((detail.get("atomdns") or {}).get("flushed"))
+            ok_all = (not err) or detail.get("clash") == "已清理" or atomdns_ok
+            return {"action": name, "ok": ok_all,
+                    "message": ("已提交" if ok_all else "部分失败：") + _ACTION_NAMES[name],
+                    "detail": detail, "notes": notes}
 
         if name == "close":
             data, err = self.__luci_post("close_all_connection", {})
@@ -2996,7 +3691,8 @@ class OpenClashMonitor(_PluginBase):
             updates.append(f"插件：{versions.get('plugin_current') or '?'} → {versions.get('plugin_latest')}")
             markers["plugin"] = str(versions.get("plugin_latest") or "")
         if versions.get("dns_update"):
-            updates.append(f"LocalDNS：{versions.get('dns_current') or '?'} → {versions.get('dns_latest')}")
+            updates.append(f"{versions.get('dns_label') or 'DNS'}："
+                           f"{versions.get('dns_current') or '?'} → {versions.get('dns_latest')}")
             markers["dns"] = str(versions.get("dns_latest") or "")
         if not updates:
             return
@@ -3453,7 +4149,7 @@ class OpenClashMonitor(_PluginBase):
                                                "method": "POST", "params": {}}}}]},
         ]
         caption = ("定时报告由 MoviePilot 的调度器按 cron 触发，内容含状态、节点、订阅、版本、"
-                   "LocalDNS 上游健康与当前告警；渠道留空时交给 MoviePilot 的默认通知路由。")
+                   "AtomDNS 上游健康与当前告警；渠道留空时交给 MoviePilot 的默认通知路由。")
         return self.__table_card("通知报告", body, cols=12, md=12, caption=caption, extra=extra,
                                  widths=("26%", "74%"))
 
@@ -3465,8 +4161,8 @@ class OpenClashMonitor(_PluginBase):
              bool(versions.get("plugin_update"))),
             ("Meta 内核", versions.get("core_current"), versions.get("core_latest"),
              bool(versions.get("core_update"))),
-            ("LocalDNS", versions.get("dns_current"), versions.get("dns_latest"),
-             bool(versions.get("dns_update"))),
+            (versions.get("dns_label") or "DNS", versions.get("dns_current"),
+             versions.get("dns_latest"), bool(versions.get("dns_update"))),
         ]
         body: List[Dict[str, Any]] = [
             {"component": "thead",
@@ -3494,14 +4190,20 @@ class OpenClashMonitor(_PluginBase):
                  ]}
             )
         source_text = {"github-api": "GitHub Releases API",
+                       "atomdns-self": "AtomDNS 自带更新检查",
                        "raw": "GitHub raw VERSION.json",
                        "jsdelivr": "jsDelivr CDN"}.get(str(versions.get("dns_source") or ""), "")
         caption = ("插件与内核的最新版本来自 OpenClash 的 last_version 接口，首次拉取可能显示为空；"
-                   "LocalDNS 的最新版依次尝试 GitHub Releases API、raw VERSION.json 与 jsDelivr，"
+                   "AtomDNS 的最新版优先取程序自带的 /api/v1/update/status，失败时回退 GitHub Releases API；"
+                   "旧版 LocalDNS 依次尝试 GitHub Releases API、raw VERSION.json 与 jsDelivr，"
                    f"当前来源：{source_text or '尚未取到'}。")
         dns_error = str(versions.get("dns_error") or "")
         if dns_error:
             caption += f" 上次查询失败：{dns_error}"
+        dns_view = snapshot.get("dns") or {}
+        update_message = str(dns_view.get("update_message") or "")
+        if update_message and not versions.get("dns_latest"):
+            caption += f" 程序自检提示：{update_message[:120]}"
         return self.__table_card("版本与更新", body, cols=12, md=6,
                                  widths=("32%", "24%", "24%", "20%"),
                                  caption=caption)
@@ -3629,8 +4331,74 @@ class OpenClashMonitor(_PluginBase):
         return self.__table_card("订阅信息", body, cols=12, md=6, caption=caption,
                                  widths=("22%", "10%", "14%", "14%", "14%", "14%", "12%"))
 
+    def __atomdns_pairs(self, dns: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """AtomDNS 的状态行。"""
+        version_text = str(dns.get("version") or "-")
+        pairs: List[Tuple[str, str]] = [
+            ("运行状态", "运行中" if dns.get("ok") else f"不可用（{dns.get('state') or '未知'}）"),
+            ("版本", version_text),
+            ("运行时", str(dns.get("runtime") or "-")),
+            ("分流模式", str(dns.get("mode_text") or "-")),
+            ("核心模式", str(dns.get("core_mode_text") or "-")),
+            ("DNS 监听", str(dns.get("listen") or "-")),
+            ("API 监听", str(dns.get("api_listen") or "-")),
+        ]
+        windows = dns.get("windows") if isinstance(dns.get("windows"), dict) else {}
+        if dns.get("queries") is not None:
+            span = ""
+            if dns.get("coverage_start"):
+                span = f"（{_iso_utc_to_local(dns.get('coverage_start'))} 起）"
+            pairs.append(("审计查询", f"{dns.get('queries')} 次{span}"))
+        if isinstance(windows.get("24h"), dict):
+            pairs.append(("24 小时", f"{windows['24h'].get('count')} 次，"
+                                     f"平均 {windows['24h'].get('avg_ms')} ms"))
+        if isinstance(windows.get("1h"), dict):
+            pairs.append(("最近 1 小时", f"{windows['1h'].get('count')} 次"))
+        if dns.get("blocked") is not None:
+            pairs.append(("拦截", f"{dns.get('blocked')} 次"))
+        if dns.get("blocked_percent") is not None:
+            pairs.append(("拦截率", f"{dns.get('blocked_percent')}%（按分流命中统计）"))
+        if dns.get("query_avg_ms") is not None:
+            pairs.append(("平均查询耗时", f"{dns.get('query_avg_ms')} ms"))
+        if dns.get("avg_ms") is not None:
+            pairs.append(("平均上游延迟", f"{dns.get('avg_ms')} ms"))
+        if dns.get("cache_query") is not None:
+            hit_pct = dns.get("cache_hit_percent")
+            cached = f"{dns.get('cache_hit')}/{dns.get('cache_query')}"
+            if hit_pct is not None:
+                cached += f"（{hit_pct}%）"
+            pairs.append(("缓存命中", cached))
+        if dns.get("cache_entries") is not None:
+            pairs.append(("缓存条目", f"{dns.get('cache_entries')} 条"))
+        if dns.get("upstream_queries") is not None:
+            pairs.append(("上游查询", f"{dns.get('upstream_queries')} 次，"
+                                     f"失败 {dns.get('upstream_errors') or 0} 次"))
+        switches = [label for key, label in (("block_blocklist", "黑名单"),
+                                             ("block_ads", "广告"),
+                                             ("block_aaaa", "IPv6"),
+                                             ("cn_fakeip", "国内 FakeIP"))
+                    if dns.get(key)]
+        if switches:
+            pairs.append(("已开启屏蔽", "、".join(switches)))
+        if dns.get("cpu_percent") is not None:
+            pairs.append(("进程 CPU", f"{dns.get('cpu_percent')}%"))
+        if dns.get("mem_bytes"):
+            pairs.append(("进程内存", _format_size(dns.get("mem_bytes"))))
+        if dns.get("uptime_seconds"):
+            pairs.append(("运行时长", _format_uptime(dns.get("uptime_seconds"))))
+        if dns.get("memory_entries"):
+            categories = "、".join(f"{item.get('name')} {item.get('count')}"
+                                   for item in (dns.get("memory_categories") or [])[:4])
+            pairs.append(("路由记忆", f"{dns.get('memory_entries')} 条"
+                                     + (f"（{categories}）" if categories else "")))
+        requery = dns.get("requery") if isinstance(dns.get("requery"), dict) else {}
+        if requery.get("last_end"):
+            pairs.append(("定时刷新", f"{requery.get('last_end')} 完成，"
+                                     f"{requery.get('domains')} 个域名"))
+        return pairs
+
     def __dns_card(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """LocalDNS 概览卡片。"""
+        """DNS 概览卡片（AtomDNS / LocalDNS / AdGuard Home）。"""
         dns = snapshot.get("dns") or {}
         clash_dns = dns.get("clash") or {}
         if not dns and not clash_dns:
@@ -3643,10 +4411,12 @@ class OpenClashMonitor(_PluginBase):
             {"component": "tbody", "content": []},
         ]
         provider = str(dns.get("provider") or "none")
-        provider_text = {"localdns": "LocalDNS", "adguard": "AdGuard Home"}.get(
-            provider, "内置 UDP 探测")
+        provider_text = {"atomdns": "AtomDNS", "localdns": "LocalDNS（旧版）",
+                         "adguard": "AdGuard Home"}.get(provider, "内置 UDP 探测")
         pairs: List[Tuple[str, str]] = [("DNS 来源", provider_text)]
-        if provider == "localdns":
+        if provider == "atomdns":
+            pairs.extend(self.__atomdns_pairs(dns))
+        elif provider == "localdns":
             version_text = str(dns.get("version") or "-")
             if dns.get("core_version"):
                 version_text = f"{version_text}（核心 {dns['core_version']}）"
@@ -3685,6 +4455,8 @@ class OpenClashMonitor(_PluginBase):
                 ("Clash 上游", "、".join(clash_dns.get("nameserver") or []) or "-"),
                 ("Fake-IP 段", str(clash_dns.get("fakeip_range") or "-")),
             ])
+        if dns.get("fallback_note"):
+            pairs.append(("说明", str(dns.get("fallback_note"))))
         if dns.get("error"):
             pairs.append(("错误", str(dns.get("error"))))
         for name, value in pairs:
@@ -3698,7 +4470,7 @@ class OpenClashMonitor(_PluginBase):
 
         upstreams = dns.get("upstreams") or []
         health = [x for x in (dns.get("upstream_health") or []) if isinstance(x, dict)]
-        is_ld = provider == "localdns"
+        detailed = provider in ("localdns", "atomdns")
         if upstreams and not health:
             rows.append(
                 {"component": "tr",
@@ -3710,19 +4482,25 @@ class OpenClashMonitor(_PluginBase):
             )
         groups = dns.get("upstream_groups") or []
         if groups:
+            bits = []
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                text = f"{group.get('name')}({group.get('enabled')}/{group.get('count')})"
+                if group.get("active") is False:
+                    text += "·未启用"
+                bits.append(text)
             rows.append(
                 {"component": "tr",
                  "content": [
                      {"component": "td", "props": {"class": "font-weight-medium"},
                       "text": "上游分组"},
-                     {"component": "td",
-                      "text": "、".join(f"{g.get('name')}({g.get('enabled')}/{g.get('count')})"
-                                       for g in groups if isinstance(g, dict))},
+                     {"component": "td", "text": "、".join(bits)},
                  ]}
             )
         up_content: List[Dict[str, Any]] = []
         if upstreams or health:
-            head_cols = ("上游 DNS", "分组", "协议", "健康", "延迟", "请求/失败") if is_ld \
+            head_cols = ("上游 DNS", "分组", "协议", "健康", "延迟", "请求/失败") if detailed \
                 else ("上游 DNS", "健康", "延迟")
             up_rows: List[Dict[str, Any]] = [
                 {"component": "thead",
@@ -3731,28 +4509,36 @@ class OpenClashMonitor(_PluginBase):
                                           for text in head_cols]}]},
                 {"component": "tbody", "content": []},
             ]
+
+            def health_cell(item: Dict[str, Any]) -> Dict[str, Any]:
+                """健康状态单元格：正常 / 轻微失败 / 异常 / 空闲。"""
+                state = str(item.get("state") or ("ok" if item.get("ok") else "error"))
+                if state == "ok":
+                    return {"component": "td", "props": {"class": "text-success"}, "text": "正常"}
+                if state == "warn":
+                    return {"component": "td", "props": {"class": "text-warning"}, "text": "轻微失败"}
+                if state == "idle":
+                    return {"component": "td", "props": {"class": "text-medium-emphasis"},
+                            "text": "空闲"}
+                return {"component": "td", "props": {"class": "text-error"}, "text": "异常"}
+
             if health:
                 for item in health:
-                    ok = bool(item.get("ok"))
                     latency = item.get("latency_ms")
                     latency_text = f"{latency:g} ms" if isinstance(latency, (int, float)) else "-"
                     cells: List[Dict[str, Any]] = [
                         {"component": "td", "props": {"class": "font-weight-medium"},
                          "text": str(item.get("server") or "-")},
                     ]
-                    if is_ld:
+                    if detailed:
                         cells.extend([
                             {"component": "td", "text": str(item.get("group") or "-")},
                             {"component": "td", "props": {"class": "text-medium-emphasis"},
                              "text": str(item.get("protocol") or "-")},
                         ])
-                    cells.extend([
-                        {"component": "td",
-                         "props": {"class": "text-success" if ok else "text-error"},
-                         "text": "正常" if ok else "异常"},
-                        {"component": "td", "text": latency_text},
-                    ])
-                    if is_ld:
+                    cells.append(health_cell(item))
+                    cells.append({"component": "td", "text": latency_text})
+                    if detailed:
                         failures = _safe_int(item.get("errors"), 0) + _safe_int(item.get("timeouts"), 0)
                         cells.append({"component": "td", "props": {"class": "text-medium-emphasis"},
                                       "text": f"{_safe_int(item.get('requests'), 0)}/{failures}"})
@@ -3764,13 +4550,13 @@ class OpenClashMonitor(_PluginBase):
                         {"component": "td", "props": {"class": "font-weight-medium"},
                          "text": str(server)},
                     ]
-                    if is_ld:
+                    if detailed:
                         cells.extend([{"component": "td", "text": "-"},
                                       {"component": "td", "text": "-"}])
                     cells.append({"component": "td",
                                   "props": {"class": "text-medium-emphasis"}, "text": "未测试"})
                     cells.append({"component": "td", "text": "-"})
-                    if is_ld:
+                    if detailed:
                         cells.append({"component": "td", "text": "-"})
                     up_rows[1]["content"].append({"component": "tr", "content": cells})
             up_content = [
@@ -3787,6 +4573,15 @@ class OpenClashMonitor(_PluginBase):
                                        f"{item.get('server')} → {item.get('error')}"
                                        for item in errors_detail[:3])})
 
+        rank = [x for x in (dns.get("rank") or []) if isinstance(x, dict)]
+        if rank:
+            up_content.append({"component": "div",
+                               "props": {"class": "text-subtitle-2 mt-4 mb-2"},
+                               "text": "分流命中分类"})
+            up_content.append({"component": "div", "props": {"class": "text-body-2"}, "content": [
+                {"component": "div", "text": f"{item.get('name')}：{item.get('count')} 次"}
+                for item in rank[:6]
+            ]})
         top = dns.get("top_domains") or []
         if top:
             up_content.append({"component": "div",
@@ -3796,8 +4591,22 @@ class OpenClashMonitor(_PluginBase):
                 {"component": "div", "text": f"{idx}. {item.get('name')}（{item.get('count')} 次）"}
                 for idx, item in enumerate(top[:5], start=1)
             ]})
+        slowest = [x for x in (dns.get("slowest") or []) if isinstance(x, dict)]
+        if slowest:
+            up_content.append({"component": "div",
+                               "props": {"class": "text-subtitle-2 mt-4 mb-2"},
+                               "text": "最慢查询"})
+            up_content.append({"component": "div", "props": {"class": "text-body-2"}, "content": [
+                {"component": "div",
+                 "text": f"{item.get('domain')} {item.get('ms')} ms（{item.get('code') or '-'}）"}
+                for item in slowest[:3]
+            ]})
 
-        if provider == "localdns":
+        if provider == "atomdns":
+            caption = ("「上游 DNS 健康」取自 AtomDNS 的 /metrics 累计请求、错误与延迟直方图"
+                       "（空闲＝该上游本轮没被选中）；「拦截率」按分流命中统计（黑名单＋广告屏蔽"
+                       " ÷ 有分流结果的查询）；「审计查询」受审计记录容量限制，覆盖起点见上。")
+        elif provider == "localdns":
             caption = ("「上游 DNS 健康」取自 LocalDNS 的 upstream_stats 累计统计"
                        "（含请求数/失败数/平均延迟）；下方「主动探测」是插件自己发起的独立校验。")
         elif provider == "adguard":
@@ -3805,7 +4614,9 @@ class OpenClashMonitor(_PluginBase):
                        "若 AdGuard 未返回，可参考下方「主动探测」面板。")
         else:
             caption = "未启用 DNS 接口采集，仅展示 Clash 内置 DNS 与主动探测结果。"
-        return self.__table_card("LocalDNS 状态", rows, cols=12, md=12, caption=caption,
+        title = {"atomdns": "AtomDNS 状态", "localdns": "LocalDNS 状态（旧版）"}.get(
+            provider, "DNS 状态")
+        return self.__table_card(title, rows, cols=12, md=12, caption=caption,
                                  widths=("24%", "76%"),
                                  extra=up_content)
 
@@ -3879,12 +4690,16 @@ class OpenClashMonitor(_PluginBase):
                       "text": str(item.get("result") or "-")},
                  ]}
             )
-        provider_text = {"localdns": "LocalDNS", "adguard": "AdGuard Home"}.get(
-            str(dns.get("provider") or ""), "DNS 服务")
+        provider = str(dns.get("provider") or "")
+        provider_text = {"atomdns": "AtomDNS", "localdns": "LocalDNS",
+                         "adguard": "AdGuard Home"}.get(provider, "DNS 服务")
+        if provider == "atomdns":
+            reason = "「拦截」依据 AtomDNS 的生效标签（黑名单 / 广告屏蔽）与响应码"
+        else:
+            reason = "「拦截」依据 LocalDNS 的 domain_set 归类（adguard/blocked 系列）"
         return self.__table_card("最近 DNS 查询", body, cols=12, md=12,
                                  widths=("13%", "29%", "8%", "13%", "10%", "10%", "17%"),
-                                 caption=f"来自 {provider_text} 的查询日志，按时间倒序；"
-                                         "「拦截」依据 LocalDNS 的 domain_set 归类（adguard/blocked 系列）。")
+                                 caption=f"来自 {provider_text} 的查询日志，按时间倒序；{reason}。")
 
     @staticmethod
     def __polish_tables(node: Any) -> Any:
@@ -4000,12 +4815,17 @@ class OpenClashMonitor(_PluginBase):
         if versions.get("plugin_update"):
             health_bits.append(f"插件可更新：{versions.get('plugin_current')} → {versions.get('plugin_latest')}")
         if versions.get("dns_update"):
-            health_bits.append(f"LocalDNS 可更新：{versions.get('dns_current')} → {versions.get('dns_latest')}")
-        if dns.get("provider") == "adguard" and dns.get("ok"):
-            health_bits.append(
-                f"DNS 查询 {dns.get('queries')} 次，拦截 {dns.get('blocked')} 次"
-                f"（{dns.get('blocked_percent') or 0}%），平均 {dns.get('avg_ms') or '-'} ms"
-            )
+            health_bits.append(f"{versions.get('dns_label') or 'DNS'} 可更新："
+                               f"{versions.get('dns_current')} → {versions.get('dns_latest')}")
+        if dns.get("provider") in ("adguard", "atomdns") and dns.get("ok"):
+            provider_name = "AtomDNS" if dns.get("provider") == "atomdns" else "AdGuard"
+            bit = (f"{provider_name} 查询 {dns.get('queries')} 次，拦截 {dns.get('blocked')} 次"
+                   f"（{dns.get('blocked_percent') or 0}%），平均 {dns.get('query_avg_ms') or dns.get('avg_ms') or '-'} ms")
+            if dns.get("cache_hit_percent") is not None:
+                bit += f"，缓存命中 {dns.get('cache_hit_percent')}%"
+            if dns.get("mode_text"):
+                bit += f"，{dns.get('mode_text')}"
+            health_bits.append(bit)
         probe = snapshot.get("probe") or []
         if probe:
             ok_count = sum(1 for item in probe if item.get("ok"))
@@ -4091,10 +4911,15 @@ class OpenClashMonitor(_PluginBase):
                 f"可更新：内核 {versions.get('core_current')} → {versions.get('core_latest')}，"
                 f"插件 {versions.get('plugin_current')} → {versions.get('plugin_latest')}"
             )
-        if dns.get("provider") in ("adguard", "localdns") and dns.get("ok"):
-            lines.append(
-                f"DNS：查询 {dns.get('queries')} 次，拦截率 {dns.get('blocked_percent') or 0}%"
-            )
+        if dns.get("provider") in ("adguard", "localdns", "atomdns") and dns.get("ok"):
+            provider_name = {"atomdns": "AtomDNS", "localdns": "LocalDNS",
+                             "adguard": "AdGuard"}.get(str(dns.get("provider")), "DNS")
+            detail = f"{provider_name}：查询 {dns.get('queries')} 次，拦截率 {dns.get('blocked_percent') or 0}%"
+            if dns.get("mode_text"):
+                detail += f"，{dns.get('mode_text')}"
+            if dns.get("cache_hit_percent") is not None:
+                detail += f"，缓存命中 {dns.get('cache_hit_percent')}%"
+            lines.append(detail)
         errors = [str(e) for e in (snapshot.get("errors") or []) if e]
         if errors:
             lines.append("异常：" + "；".join(errors)[:200])
