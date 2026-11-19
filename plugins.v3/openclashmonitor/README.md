@@ -1,8 +1,25 @@
 # OpenClash 监控
 
-在 MoviePilot 里集中查看 OpenWrt（iStoreOS / OpenWrt）上 OpenClash（Mihomo / Clash Meta 内核）与 LocalDNS 的运行状况。
+在 MoviePilot 里集中查看 OpenWrt（iStoreOS / OpenWrt）上 OpenClash（Mihomo / Clash Meta 内核）与 **AtomDNS** 的运行状况。
 
-已在真实设备验证：iStoreOS + OpenClash `v0.48.002` + Mihomo `alpha-gbc76c13` + LocalDNS `FJGOE / 2026.10.23.2`。
+已在真实设备验证：iStoreOS + OpenClash `v0.48.002` + Mihomo `v1.19.34` + **AtomDNS `v0.6.6`（FakeIP 分流）**；旧版 LocalDNS 与 AdGuard Home 仍保留兼容。
+
+## 0.6.0 更新（对接 AtomDNS）
+
+- **新增 AtomDNS 采集**：`http://<路由器>:19100`（WebUI 与 API 同端口，无鉴权）。
+  - 状态：`/api/v1/system/health` → 版本、运行时、ready/state、监听地址、UI 版本。
+  - 分流：`/api/v1/flags` → FakeIP/RealIP 分流、兼容/安全模式、黑名单/广告/IPv6 屏蔽开关。
+  - 上游：`/api/v1/upstream/groups` + `/api/v1/upstream/config` + `/metrics` → 分组是否启用、协议（DoH/DoT/UDP/经代理）、
+    累计请求/失败、直方图平均延迟；「空闲」表示该上游本轮没被选中，不算故障。
+  - 查询与拦截：`/api/v2/audit/stats`（总量、平均耗时）、`/stats/windows`（1h/24h）、`/rank/effective`（分流命中分类，
+    拦截率＝黑名单＋广告屏蔽 ÷ 有分流结果的查询）、`/rank/domain`、`/rank/client`、`/rank/slowest`、`/audit/logs`（查询日志）。
+  - 缓存：`/metrics` 的 `atomdns_cache_*` → 命中数/查询数/命中率/条目数。
+  - 其他：`/plugins/requery/status`（定时刷新）、`/plugins/route_learner/status`（路由记忆条目）、
+    `/api/v1/update/status`（版本更新，失败时回退 GitHub Releases API）。
+- **一键清理 DNS 缓存时顺带清 AtomDNS 的六层缓存**（`/plugins/<tag>/flush`），切分流模式后不用再手敲命令。
+- **旧配置自动迁移**：如果保存的仍是 `dns_mode=localdns` + `19099`，插件启动时探测到 19100 有 AtomDNS 就自动切换并回写配置；
+  `atomdns` 地址留空时按路由器地址自动拼 `:19100`。LocalDNS 确认不可达时也会在本次采集中自动回退到 AtomDNS。
+- 端口/地址全部可配，旧版 LocalDNS（19099）与 AdGuard Home 逻辑保持原样。
 
 ## 能监控什么
 
@@ -12,19 +29,19 @@
 | 节点信息 | 策略组列表、每组当前选择、成员数、在线数；每个节点的机场来源、类型、最新延迟、状态（正常/超时/未测速/离线） | Clash API `/proxies` + `/providers/proxies` |
 | 订阅信息 | 每个配置文件的订阅 HTTP 状态、已用/总量/剩余流量、剩余天数、使用率 | LuCI `sub_info_get` + `config_name` |
 | 版本更新 | OpenClash 插件版本、Meta 内核版本，与上游最新版对比并标注「可更新」 | LuCI `update` + `last_version` |
-| LocalDNS | 运行状态、核心与 UI 版本、更新通道、监听地址、累计查询、拦截量与拦截率、缓存命中、屏蔽规则数、进程 CPU/内存/运行时长 | LocalDNS `/api/v1/status` + `/metrics` |
-| 上游 DNS 健康 | 按分组（domestic / foreign / foreign_ecs / proxy）列出每个上游的协议、请求数、失败数、超时数、平均延迟、最近一次错误 | LocalDNS `/api/v1/status` 的 `upstream_stats` |
-| 查询日志 | 最近查询的时间、域名、类型、客户端、拦截/放行、耗时、响应码 | LocalDNS `/api/v1/querylog/entries` |
+| AtomDNS | 运行状态、版本与运行时、分流模式（FakeIP/RealIP）、核心模式（兼容/安全）、监听地址、查询量（审计/24h/1h）、拦截量与拦截率、平均查询耗时、缓存命中与条目、路由记忆、定时刷新、进程 CPU/内存/运行时长 | AtomDNS `/api/v1/system/health` + `/api/v1/flags` + `/api/v2/audit/*` + `/metrics` |
+| 上游 DNS 健康 | 按分组（domestic / foreign / foreignecs / nocnfake / cnfake）列出每个上游的协议、请求数、失败数、平均延迟、是否启用 | AtomDNS `/api/v1/upstream/*` + `/metrics` |
+| 查询日志 | 最近查询的时间、域名、类型、客户端、拦截/放行、耗时、响应码 | AtomDNS `/api/v2/audit/logs` |
 | 主动探测 | 由 MoviePilot 直接向指定上游 DNS 发 UDP 查询，测量真实延迟与解析结果 | 内置 UDP 客户端，不依赖任何接口 |
 | 趋势曲线 | 节点在线数/总数、拦截率与上游平均延迟的历史曲线（按小时聚合） | 每次采集写入快照的 `trend` 字段 |
 | 异常提醒 | 采集失败、节点掉线比例超阈值、某条上游 DNS 连续失败、订阅即将到期或已过期 | 采集结果 + 通知渠道 |
-| 一键操作 | 启动/停止/重启 OpenClash、切换规则模式、切换策略组节点、清理 DNS/Fake-IP 缓存、关闭全部连接、切换配置文件 | 远程命令 + REST API（页面只读，见下文） |
+| 一键操作 | 启动/停止/重启 OpenClash、切换规则模式、切换策略组节点、清理 DNS/Fake-IP 缓存（含 AtomDNS 六层缓存）、关闭全部连接、切换配置文件 | 远程命令 + REST API（页面只读，见下文） |
 | 内嵌面板 | 插件页里直接嵌入 zashboard，可在面板里切代理组、看连接与延迟 | zashboard 地址 + iframe（`html` 节点） |
 | 页面快捷切换 | 不用打开 zashboard，直接在插件页点按钮切规则模式、切策略组节点 | 页面 `events.click` → `POST /action_web` |
 | 定时报告 | 按 cron 把状态/节点/订阅/版本/DNS/告警汇总推送到 Telegram、QQ 或企业微信 | 调度任务 + `post_message(channel=...)` |
 | Clash 内置 DNS | enhanced-mode（fake-ip/redir-host）、nameserver、fallback、fake-ip-range | Clash API `/configs` |
 
-> 三路数据源互相独立：**Clash API 是必须的**（节点、运行状态、Clash DNS 都靠它）；**LuCI 是可选的**（只有订阅流量和插件/内核版本需要它）；**LocalDNS 也是可选的**（查询日志、上游健康与版本）。缺哪一路，其余部分照常工作，页面上会明确提示缺失原因。
+> 三路数据源互相独立：**Clash API 是必须的**（节点、运行状态、Clash DNS 都靠它）；**LuCI 是可选的**（只有订阅流量和插件/内核版本需要它）；**AtomDNS 也是可选的**（查询统计、拦截率、上游健康与版本）。缺哪一路，其余部分照常工作，页面上会明确提示缺失原因。
 
 ## 安装
 
@@ -42,15 +59,16 @@ cp -r openclashmonitor plugins.v3/
 | --- | --- |
 | 启用插件 | 定时采集开关 |
 | 显示首页仪表板 | 是否在首页展示监控面板 |
-| 版本更新时通知 | 内核/插件/LocalDNS 有新版本时发一条通知（同一版本只发一次） |
+| 版本更新时通知 | 内核/插件/AtomDNS 有新版本时发一条通知（同一版本只发一次） |
 | Clash API 地址 | 形如 `http://192.168.1.1:9090`。留空时尝试用 LuCI 返回的 IP + `cn_port` 自动推断 |
 | Clash API 密钥 | `external-controller` 的 `secret`。留空时尝试用 LuCI `status` 里的 `dase`（老版本 OpenClash） |
 | 路由器地址 | 形如 `http://192.168.1.1`，用于订阅流量与版本更新。没有 LuCI 访问时留空 |
 | LuCI Cookie | 已登录浏览器里复制 `sysauth_http=...`，优先级高于账号密码 |
 | LuCI 用户名 / 密码 | 用于自动登录，需路由器允许 `/cgi-bin/luci` 外部访问 |
-| LocalDNS 类型 | `localdns`（yyhoworks 的 LocalDNS，推荐）/ `adguard`（AdGuard Home）/ `none` |
-| LocalDNS 地址 | 形如 `http://192.168.1.1:19099`（LocalDNS 默认 API 端口 19099） |
-| 从 GitHub 检查版本 | 是否读取 LocalDNS 的 GitHub releases 与本地版本比较 |
+| DNS 监控程序 | `atomdns`（推荐）/ `localdns`（旧版，已退役）/ `adguard`（AdGuard Home）/ `none` |
+| AtomDNS 地址 | 形如 `http://192.168.1.1:19100`（WebUI 与 API 同端口）；**留空时按路由器地址自动拼 `:19100`** |
+| LocalDNS 地址（旧版） | 形如 `http://192.168.1.1:19099`，仅在仍运行 LocalDNS 时填写 |
+| 在线查版本 | 是否读取上游最新版本（AtomDNS 先问它自己的更新检查，失败再走 GitHub；LocalDNS 走 GitHub releases） |
 | AdGuard 地址 / 用户名 / 密码 | 形如 `http://192.168.1.1:3000`，走 Basic Auth（仅 `dns_mode=adguard` 时使用） |
 | AdGuard 上游测速 | 是否调用 `test_upstream_dns`（会向上游真实发包，耗时约数秒） |
 | 主动探测目标 | 逗号分隔，如 `223.5.5.5,119.29.29.29,1.1.1.1`；支持 `host:port` |
@@ -134,28 +152,39 @@ curl -X POST "http://<MoviePilot地址>:3000/api/v1/plugin/OpenClashMonitor/acti
 > 判断「是不是真实节点」用的是 `type` 字段（`Direct`/`Reject`/`RejectDrop`/`Compatible`/`Pass`/`PassRule`/`Dns` 都算内置），
 > 不是名字名单——所以中文的「直连」「拒绝」也能正确排除。
 
-### 关于「LocalDNS」
+### 关于 DNS 程序（AtomDNS 为主）
 
 路由器上的 DNS 实现常见有几种，本插件对它们的支持程度不同：
 
-- **LocalDNS（github.com/yyhoworks/LocalDNS）**：全部功能可用——状态、统计、上游健康、查询日志、进程指标、版本更新。
-  上游健康来自它自己的统计（`upstream_stats`），比主动测速更贴近真实流量。
+- **AtomDNS（github.com/jasonxtt/atomdns，默认）**：全部功能可用——状态、分流模式、上游健康、查询统计与拦截率、
+  查询日志、缓存命中、定时刷新、路由记忆、进程指标、版本更新，以及「一键清理六层缓存」。
+  上游健康来自它自己的 `/metrics` 累计计数与延迟直方图，比主动测速更贴近真实流量。
+- **LocalDNS（github.com/yyhoworks/LocalDNS，已退役）**：逻辑保留——状态、统计、上游健康、查询日志、进程指标、版本更新。
+  2026-11 起主流部署已换成 AtomDNS；本插件检测到 19099 不可用而 19100 可用时会自动迁移。
 - **AdGuard Home**：查询日志、拦截率、上游模式、上游测速 → 功能可用，但上游健康需要在页面上手动点一次测速（`ag_test_upstream`）。
 - **Clash/Mihomo 内置 DNS**：不需要额外配置，插件总会展示 enhanced-mode、上游 nameserver、fake-ip 段。
 - **dnsmasq / SmartDNS / mosdns**：没有统一 HTTP API，插件只做「主动 UDP 探测」来判定上游是否健康；查询日志取不到。
 
-### 关于 LocalDNS 版本更新
+### 关于 AtomDNS 的指标口径
 
-LocalDNS 没有自带的「检查更新」接口，插件用两个来源比对：
+- **审计查询**：来自 `GET /api/v2/audit/stats` 的 `total_queries`，受审计记录容量限制，页面上会给出这次统计的覆盖起点；
+  `1h` / `24h` 来自 `/api/v2/audit/stats/windows`，窗口没跑满时 `complete=false`，数值等于已覆盖部分。
+- **拦截率**：按 `/api/v2/audit/rank/effective` 的「分流命中」统计——分子是生效标签含「黑名单 / 广告屏蔽 / 拦截」的次数，
+  分母是有分流结果的查询总数（缓存命中不在其中），所以和「审计查询」不是同一个分母，页面说明里已标注。
+- **上游健康**：`/metrics` 里的 `atomdns_aliapi_query_total` / `_error_total` / `_response_latency_millisecond_sum|count`。
+  地址按「去协议前缀」归一化后与 `/api/v1/upstream/config` 对齐（配置写 `223.5.5.5`、指标写 `udp://223.5.5.5` 视为同一台）。
+  历史累计里偶发 1–2 次失败且失败率 < 1% 标为「轻微失败」，≥1% 或 ≥3 次标红；请求数为 0 标为「空闲」。
+- **缓存**：`atomdns_cache_query_total` / `_hit_total` / `_lazy_hit_total` / `_size_current` 按缓存 tag 汇总。
+- **定时刷新**：`/plugins/requery/status` 的最近一次执行时间与域名数。
 
-- 本地：`GET /ui/version.json` → `uiVersion`、`backendVersion`（核心代号，如 `FJGOE`）、`releaseTag`。
-- 远端按三条路径依次尝试，任意一条成功即用（页面的「版本与更新」卡片会标注当前来源）：
-  1. `https://api.github.com/repos/yyhoworks/LocalDNS/releases/latest` 的 tag，规则是 `<核心代号小写>-ui-v<UI版本>`（如 `fjgoe-ui-v2026.10.23.3`）；
-  2. `https://raw.githubusercontent.com/yyhoworks/LocalDNS/main/VERSION.json`（仓库根目录的版本文件，`uiVersion` / `backendVersion` / `releaseTag`）；
-  3. `https://cdn.jsdelivr.net/gh/yyhoworks/LocalDNS@main/VERSION.json`（jsDelivr 镜像，api.github.com 被墙时基本可用）。
-- 国内网络经常访问不了 `api.github.com`，所以必须有后两条兜底；三条都失败时「最新版本」显示 `-`、状态显示「未知」，卡片底部会写出失败原因。
+### 关于版本更新
 
-UI 版本按语义化版本比较；核心代号不同时会在页面上额外提示「通道不一致」。
+- **AtomDNS**：优先读它自己的更新检查 `GET /api/v1/update/status`（含当前/最新版本、资产名、发布时间）；
+  取不到最新版时会先 `POST /api/v1/update/check` 触发一次，再失败才回退
+  `https://api.github.com/repos/jasonxtt/atomdns/releases/latest`（并挑出 `atomdns-linux-amd64-musl.tar.gz`）。
+  版本查询失败只在「版本与更新」卡片的说明里提示，不计入采集异常。
+- **LocalDNS（旧版）**：本地 `GET /ui/version.json` → `uiVersion`、`backendVersion`（核心代号）、`releaseTag`；
+  远端 `releases/latest` 的 tag 规则是 `<核心代号小写>-ui-v<UI版本>`（如 `fjgoe-ui-v2026.10.23.2`）。
 
 ## 对外 API
 
@@ -168,7 +197,7 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 | `/nodes` | 节点与策略组 |
 | `/subscriptions` | 订阅流量与到期 |
 | `/versions` | 版本对比结果 |
-| `/dns` | LocalDNS 与上游 DNS 健康 |
+| `/dns` | AtomDNS（或 LocalDNS / AdGuard Home）与上游 DNS 健康 |
 | `/probe` | 立即重新探测上游 DNS |
 | `/trend` | 趋势曲线数据（节点、拦截率、上游延迟） |
 | `/alerts` | 当前告警列表 |
@@ -179,11 +208,6 @@ UI 版本按语义化版本比较；核心代号不同时会在页面上额外�
 Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_trend` 返回最近趋势、`/openclash_report` 立即发一条报告，
 另有 `/openclash_restart`、`/openclash_start`、`/openclash_stop`、`/openclash_rule`、`/openclash_flush`、`/openclash_node`、`/openclash_report_channels`。
 
-## 页面布局
-
-- 所有卡片宽度一致、从上到下依次排列；内容少的「版本与更新」和「订阅信息」合并成一行（各占一半），其余卡片整行占满。
-- 表格单元格允许换行、按百分比固定列宽（`table-layout: fixed`），长文件名/长节点名在卡片内折行，不会撑出横向滚动条。
-
 ## 已知限制
 
 1. **跨机访问 LuCI 需要登录**：登录请求必须带 `Referer: http://<路由器>/cgi-bin/luci/`，否则返回 403；
@@ -192,11 +216,13 @@ Telegram / 微信命令：`/openclash` 返回运行状态摘要、`/openclash_tr
 2. **订阅剩余流量依赖 OpenClash 自己的解析**：`sub_info_get` 里 `surplus`/`expire`/`day_left` 可能是字符串 `"null"`
    （该机场不提供流量或到期信息），插件会显示「不支持查询」/「未知」。
 3. **CPU 与内存是采样值**：OpenClash 新版 `toolbar_show` 直接给出 `cpu`（0~1 小数）与 `mem`，插件据此换算；
-   老版本只有 `cpu_ticks` 时退化为两次采样求差，误差在数百毫秒级。LocalDNS 的 CPU 也是两次采样 `/metrics` 求差。
-4. **主动 DNS 探测使用 UDP/53**：如果上游只支持 DoH/DoT，请把 `tls://`、`https://` 形式的地址留给 LocalDNS/AdGuard，
+   老版本只有 `cpu_ticks` 时退化为两次采样求差，误差在数百毫秒级。AtomDNS / LocalDNS 的 CPU 也是两次采样 `/metrics` 求差。
+4. **主动 DNS 探测使用 UDP/53**：如果上游只支持 DoH/DoT，请把 `tls://`、`https://` 形式的地址留给 AtomDNS/AdGuard，
    不要放进主动探测列表。
-5. **新版 Mihomo 的 `/configs` 可能不再带 `dns` 段**（如 `alpha-gbc76c13`）：此时 `enhanced-mode`、上游 `nameserver`、
-   fake-ip 段都取不到，插件改为按 LuCI `run_mode`（`fake-ip` / `redir-host`）推断 DNS 模式，上游列表请以 LocalDNS 面板为准。
+5. **新版 Mihomo 的 `/configs` 可能不再带 `dns` 段**（如 `v1.19.x`）：此时 `enhanced-mode`、上游 `nameserver`、
+   fake-ip 段都取不到，插件改为按 LuCI `run_mode`（`fake-ip` / `redir-host`）推断 DNS 模式，上游列表请看 AtomDNS 卡片。
+6. **AtomDNS 的审计统计有容量上限**：查询/命中/拦截都按审计表里保留的记录统计，超过容量后会滚动淘汰，
+   覆盖起点会显示在卡片上；需要长周期趋势请以次数而非累计值为准。
 6. **订阅信息接口较慢**：`sub_info_get` 会现场请求机场的订阅链接，插件给它 3 倍超时（至少 20s），
    首轮采集可能比其他分区慢几秒。
 7. **一键操作会真实改变路由器状态**：重启/停止 OpenClash、关闭全部连接、切换配置文件会短暂断网，
